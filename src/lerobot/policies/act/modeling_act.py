@@ -253,6 +253,68 @@ class ACTTemporalEnsembler:
         return action
 
 
+class LookCloserAttention(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv_query = nn.Conv2d(
+            in_channels=in_channels, out_channels=in_channels, kernel_size=1
+        )
+        self.conv_key = nn.Conv2d(
+            in_channels=in_channels, out_channels=in_channels, kernel_size=1
+        )
+        self.conv_value = nn.Conv2d(
+            in_channels=in_channels, out_channels=in_channels, kernel_size=1
+        )
+        self.in_channels = in_channels
+
+    def forward(self, query, key, value):
+        N, C, H, W = query.shape
+        q = self.conv_query(query).reshape(N, C, H * W)
+
+        Nk, Ck, Hk, Wk = key.shape
+        k = self.conv_key(key).reshape(Nk, Ck, Hk * Wk)
+
+        Nv, Cv, Hv, Wv = value.shape
+        v = self.conv_value(value).reshape(Nv, Cv, Hv * Wv)
+
+        # Attention map (spatial attention)
+        # (N, HW_k, C) @ (N, C, HW_q) -> (N, HW_k, HW_q)
+        attention = k.transpose(1, 2) @ q / (C**0.5)
+        attention = attention.softmax(dim=1)
+        self.last_attention_map = attention.detach()
+
+        # (N, C, HW_v) @ (N, HW_v, HW_q) -> (N, C, HW_q)
+        output = v @ attention
+        output = output.reshape(N, C, H, W)
+        return query + output
+
+
+class LookCloserMlp(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        drop=0.0,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
 class ACT(nn.Module):
     """Action Chunking Transformer: The underlying neural network for ACTPolicy.
 
@@ -330,6 +392,23 @@ class ACT(nn.Module):
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+
+            # IMPROVEMENT: Look Closer modules
+            # Check if we have at least 2 cameras to apply the bridging method
+            if len(self.config.image_features) >= 2:
+                feature_dim = backbone_model.fc.in_features
+                self.use_look_closer = True
+
+                # Contextual reasoning modules (2-way)
+                self.lc_attn_1 = LookCloserAttention(feature_dim)
+                self.lc_norm_1 = nn.LayerNorm(feature_dim)
+                self.lc_mlp_1 = LookCloserMlp(feature_dim)
+
+                self.lc_attn_2 = LookCloserAttention(feature_dim)
+                self.lc_norm_2 = nn.LayerNorm(feature_dim)
+                self.lc_mlp_2 = LookCloserMlp(feature_dim)
+            else:
+                self.use_look_closer = False
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -470,8 +549,51 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                # cam_features = self.backbone(img)["feature_map"]
+                # cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                # cam_features = self.encoder_img_feat_input_proj(cam_features)
+
+                # # Rearrange features to (sequence, batch, dim).
+                # cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                # cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+
+                # # Extend immediately instead of accumulating and concatenating
+                # # Convert to list to extend properly
+                # encoder_in_tokens.extend(list(cam_features))
+                # encoder_in_pos_embed.extend(list(cam_pos_embed))
+                pass
+
+            # IMPROVEMENT PREPARATION: Collect features first
+            image_features_list = []
+            for img in batch[OBS_IMAGES]:
+                image_features_list.append(self.backbone(img)["feature_map"])
+
+            # IMPROVEMENT: Look Closer mixing
+            if getattr(self, "use_look_closer", False):
+                # Apply cross-view attention between the first two views
+                # x1 encodes 3rd person, x2 encodes ego (or vice versa)
+                x1 = image_features_list[0]
+                x2 = image_features_list[1]
+
+                # Step 1: x1 attends to x2
+                tgt1 = self.lc_attn_1(x1, x2, x2)
+                # Norm + MLP
+                tgt1_perm = tgt1.permute(0, 2, 3, 1)
+                tgt1_perm = self.lc_norm_1(tgt1_perm)
+                tgt1_perm = self.lc_mlp_1(tgt1_perm)
+                image_features_list[0] = tgt1_perm.permute(0, 3, 1, 2)
+
+                # Step 2: x2 attends to x1
+                tgt2 = self.lc_attn_2(x2, image_features_list[0], image_features_list[0])
+                tgt2_perm = tgt2.permute(0, 2, 3, 1)
+                tgt2_perm = self.lc_norm_2(tgt2_perm)
+                tgt2_perm = self.lc_mlp_2(tgt2_perm)
+                image_features_list[1] = tgt2_perm.permute(0, 3, 1, 2)
+
+            for cam_features in image_features_list:
+                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
+                    dtype=cam_features.dtype
+                )
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
                 # Rearrange features to (sequence, batch, dim).
