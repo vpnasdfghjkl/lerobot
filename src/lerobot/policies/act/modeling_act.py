@@ -253,6 +253,41 @@ class ACTTemporalEnsembler:
         return action
 
 
+class SpatialRefineGate(nn.Module):
+    """Per-view channel + spatial attention gate (CBAM-style) to suppress
+    background noise before cross-view or multi-modal interaction."""
+
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        # Channel attention: which feature channels are important
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, in_channels // reduction),
+            nn.ReLU(),
+            nn.Linear(in_channels // reduction, in_channels),
+            nn.Sigmoid(),
+        )
+        # Spatial attention: which pixel locations are important
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # Channel attention
+        ca = self.channel_gate(x).unsqueeze(-1).unsqueeze(-1)
+        self.last_channel_weight = ca.detach()
+        x = x * ca
+        # Spatial attention
+        avg_out = x.mean(dim=1, keepdim=True)
+        max_out = x.max(dim=1, keepdim=True)[0]
+        sa = self.spatial_gate(torch.cat([avg_out, max_out], dim=1))
+        self.last_spatial_mask = sa.detach()
+        x = x * sa
+        return x
+
+
 class LookCloserAttention(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -393,20 +428,34 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
+            # IMPROVEMENT: Spatial Refine Gate - per-view feature refinement
+            feature_dim = backbone_model.fc.in_features
+            self.spatial_refine_gate = SpatialRefineGate(feature_dim)
+
             # IMPROVEMENT: Look Closer modules
-            # Check if we have at least 2 cameras to apply the bridging method
-            if len(self.config.image_features) >= 2:
-                feature_dim = backbone_model.fc.in_features
+            # Cross-view attention: head_cam ←→ each wrist cam
+            n_cams = len(self.config.image_features)
+            if n_cams >= 2:
                 self.use_look_closer = True
 
-                # Contextual reasoning modules (2-way)
-                self.lc_attn_1 = LookCloserAttention(feature_dim)
-                self.lc_norm_1 = nn.LayerNorm(feature_dim)
-                self.lc_mlp_1 = LookCloserMlp(feature_dim)
+                # Pair 1: head ←→ wrist_l (indices 0, 1)
+                self.lc_attn_h2l = LookCloserAttention(feature_dim)
+                self.lc_norm_h2l = nn.LayerNorm(feature_dim)
+                self.lc_mlp_h2l = LookCloserMlp(feature_dim)
 
-                self.lc_attn_2 = LookCloserAttention(feature_dim)
-                self.lc_norm_2 = nn.LayerNorm(feature_dim)
-                self.lc_mlp_2 = LookCloserMlp(feature_dim)
+                self.lc_attn_l2h = LookCloserAttention(feature_dim)
+                self.lc_norm_l2h = nn.LayerNorm(feature_dim)
+                self.lc_mlp_l2h = LookCloserMlp(feature_dim)
+
+                # Pair 2: head ←→ wrist_r (indices 0, 2)
+                if n_cams >= 3:
+                    self.lc_attn_h2r = LookCloserAttention(feature_dim)
+                    self.lc_norm_h2r = nn.LayerNorm(feature_dim)
+                    self.lc_mlp_h2r = LookCloserMlp(feature_dim)
+
+                    self.lc_attn_r2h = LookCloserAttention(feature_dim)
+                    self.lc_norm_r2h = nn.LayerNorm(feature_dim)
+                    self.lc_mlp_r2h = LookCloserMlp(feature_dim)
             else:
                 self.use_look_closer = False
 
@@ -453,6 +502,14 @@ class ACT(nn.Module):
         for p in chain(self.encoder.parameters(), self.decoder.parameters()):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def _lc_block(self, query, context, attn, norm, mlp):
+        """Apply one Look Closer cross-attention block."""
+        out = attn(query, context, context)
+        out = out.permute(0, 2, 3, 1)  # NCHW -> NHWC
+        out = norm(out)
+        out = mlp(out)
+        return out.permute(0, 3, 1, 2)  # NHWC -> NCHW
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
@@ -563,32 +620,32 @@ class ACT(nn.Module):
                 # encoder_in_pos_embed.extend(list(cam_pos_embed))
                 pass
 
-            # IMPROVEMENT PREPARATION: Collect features first
+            # IMPROVEMENT PREPARATION: Collect features first, then refine per-view
             image_features_list = []
             for img in batch[OBS_IMAGES]:
-                image_features_list.append(self.backbone(img)["feature_map"])
+                feat = self.backbone(img)["feature_map"]
+                feat = self.spatial_refine_gate(feat)
+                image_features_list.append(feat)
 
             # IMPROVEMENT: Look Closer mixing
+            # head_cam ←→ each wrist cam (star topology centered on head)
             if getattr(self, "use_look_closer", False):
-                # Apply cross-view attention between the first two views
-                # x1 encodes 3rd person, x2 encodes ego (or vice versa)
-                x1 = image_features_list[0]
-                x2 = image_features_list[1]
+                head = image_features_list[0]
+                wl = image_features_list[1]
 
-                # Step 1: x1 attends to x2
-                tgt1 = self.lc_attn_1(x1, x2, x2)
-                # Norm + MLP
-                tgt1_perm = tgt1.permute(0, 2, 3, 1)
-                tgt1_perm = self.lc_norm_1(tgt1_perm)
-                tgt1_perm = self.lc_mlp_1(tgt1_perm)
-                image_features_list[0] = tgt1_perm.permute(0, 3, 1, 2)
+                # Pair 1: head ←→ wrist_l
+                head = self._lc_block(head, wl, self.lc_attn_h2l, self.lc_norm_h2l, self.lc_mlp_h2l)
+                wl = self._lc_block(wl, head, self.lc_attn_l2h, self.lc_norm_l2h, self.lc_mlp_l2h)
+                image_features_list[0] = head
+                image_features_list[1] = wl
 
-                # Step 2: x2 attends to x1
-                tgt2 = self.lc_attn_2(x2, image_features_list[0], image_features_list[0])
-                tgt2_perm = tgt2.permute(0, 2, 3, 1)
-                tgt2_perm = self.lc_norm_2(tgt2_perm)
-                tgt2_perm = self.lc_mlp_2(tgt2_perm)
-                image_features_list[1] = tgt2_perm.permute(0, 3, 1, 2)
+                # Pair 2: head ←→ wrist_r
+                if len(image_features_list) >= 3:
+                    wr = image_features_list[2]
+                    head = self._lc_block(image_features_list[0], wr, self.lc_attn_h2r, self.lc_norm_h2r, self.lc_mlp_h2r)
+                    wr = self._lc_block(wr, head, self.lc_attn_r2h, self.lc_norm_r2h, self.lc_mlp_r2h)
+                    image_features_list[0] = head
+                    image_features_list[2] = wr
 
             for cam_features in image_features_list:
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
