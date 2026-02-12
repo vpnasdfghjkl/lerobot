@@ -1,29 +1,14 @@
 """
-One-shot visualization for SpatialRefineGate + Look Closer in ACT.
-
-Usage:
-    from lerobot.policies.act.visualize_look_closer import visualize_act_vision
-
-    # After loading policy and a batch:
-    visualize_act_vision(policy, batch, save_dir="viz_output", step=0)
-
-Generates a single figure with:
-  - Row per camera: original image | Gate spatial mask overlay | feature activation before/after Gate
-  - Cross-view attention heatmaps for each Look Closer pair
+Visualization utilities for ACT Policy features.
+Generates single-model 4-stage feature maps.
 """
 
-import numpy as np
 import torch
 import torch.nn.functional as F
+import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-
 from lerobot.utils.constants import OBS_IMAGES
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _prep_img(tensor):
     """(C, H, W) tensor -> (H, W, C) numpy, normalized to [0, 1]."""
@@ -32,11 +17,32 @@ def _prep_img(tensor):
     img = img / (img.max() + 1e-8)
     return img
 
+def _feat_to_heatmap(feat, method="norm"):
+    """
+    (C, H, W) feature -> (H, W) heatmap.
+    method: "mean" (avg value) or "norm" (vector length/energy).
+    Transformer features usually look better with "norm".
+    """
+    if feat.ndim == 2:
+        return feat.cpu().float().numpy()
 
-def _feat_to_heatmap(feat):
-    """(C, Hf, Wf) feature map -> (Hf, Wf) numpy, channel-mean activation."""
-    return feat.cpu().float().mean(dim=0).numpy()
+    if feat.ndim != 3:
+        return np.zeros((10, 10))
+    
+    if method == "norm":
+        # Calculate L2 norm across channel dimension
+        # (C, H, W) -> (H, W)
+        return torch.norm(feat.cpu().float(), p=2, dim=0).numpy()
+    else:
+        # Mean
+        return feat.cpu().float().mean(dim=0).numpy()
 
+def _min_max_norm(arr):
+    """Normalize numpy array to [0,1] for cleaner plotting."""
+    _min, _max = arr.min(), arr.max()
+    if _max - _min < 1e-8:
+        return arr - _min
+    return (arr - _min) / (_max - _min)
 
 def _upsample(heatmap, target_h, target_w):
     """Upsample a (Hf, Wf) numpy heatmap to (target_h, target_w)."""
@@ -44,223 +50,291 @@ def _upsample(heatmap, target_h, target_w):
     up = F.interpolate(t, size=(target_h, target_w), mode="bilinear", align_corners=False)
     return up[0, 0].numpy()
 
-
-def _overlay(ax, img, heatmap, title, cmap="jet", alpha=0.5, vmin=None, vmax=None):
-    """Show img with heatmap overlay."""
-    ax.imshow(img)
-    ax.imshow(heatmap, cmap=cmap, alpha=alpha, vmin=vmin, vmax=vmax)
-    ax.set_title(title, fontsize=9)
-    ax.axis("off")
-
-
-# ---------------------------------------------------------------------------
-# Main visualization
-# ---------------------------------------------------------------------------
-
-def visualize_act_vision(policy, batch, save_dir="viz_output", step=0, sample_idx=0):
+def visualize_single_model_features(
+    policy, 
+    batch, 
+    save_dir, 
+    step=0,
+    fname_prefix="viz"
+):
     """
-    Run one forward pass and generate a comprehensive visualization figure.
-
-    Args:
-        policy: ACTPolicy instance.
-        batch: A data batch dict.
-        save_dir: Output directory.
-        step: Step number for file naming.
-        sample_idx: Which sample in the batch to visualize.
+    Visualizes available feature stages for a single model.
+    Stages: Input -> Backbone -> Gate (opt) -> LookCloser (opt) -> Encoder -> DecoderAttn
     """
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    model = policy.model
-    policy.eval()
+    # 1. Inference with Hooks
+    features, decoder_attn, gate_masks = _run_viz_forward_full(policy, batch)
 
-    # --- Forward pass to populate intermediate states ---
-    with torch.no_grad():
-        # Collect raw backbone features before gate (hook)
-        raw_features = []
-        gated_features = []
-
-        original_forward = model.spatial_refine_gate.forward if hasattr(model, "spatial_refine_gate") else None
-
-        if original_forward is not None:
-            def _hook_forward(x, _orig=original_forward):
-                raw_features.append(x.detach())
-                out = _orig(x)
-                gated_features.append(out.detach())
-                return out
-
-            model.spatial_refine_gate.forward = _hook_forward
-
-        # Run model
-        policy.predict_action_chunk(batch)
-
-        # Restore
-        if original_forward is not None:
-            model.spatial_refine_gate.forward = original_forward
-
-    # --- Gather images ---
+    # 2. Get Input Images
+    imgs = []
     if OBS_IMAGES in batch:
         imgs = batch[OBS_IMAGES]
     elif policy.config.image_features:
         imgs = [batch[key] for key in policy.config.image_features]
-    else:
-        print("No images found in batch.")
+    
+    if not imgs:
+        print("No images found.")
         return
 
+    # Sample 0
+    sample_idx = 0
     n_cams = len(imgs)
-    cam_names = list(policy.config.image_features.keys()) if policy.config.image_features else [f"cam_{i}" for i in range(n_cams)]
-    # Shorten names for display
-    short_names = [n.split(".")[-1] for n in cam_names]
-
     img_h, img_w = imgs[0].shape[2], imgs[0].shape[3]
 
-    # =========================================================================
-    # Figure 1: SpatialRefineGate effect per camera
-    # =========================================================================
-    has_gate = hasattr(model, "spatial_refine_gate") and len(raw_features) > 0
+    # 3. Prepare Data for Plotting
+    plot_data = []
+    
+    # Check config 
+    use_gate = getattr(policy.config, "use_spatial_refine_gate", False)
+    use_lc = getattr(policy.config, "use_look_closer", False)
 
-    if has_gate:
-        fig1, axes1 = plt.subplots(n_cams, 4, figsize=(20, 5 * n_cams))
-        if n_cams == 1:
-            axes1 = axes1[np.newaxis, :]
+    # Feature Stages
+    # 1. Backbone (Base Feature)
+    if "backbone" in features:
+        plot_data.append(("Backbone", features["backbone"], "norm"))
+        
+    # 2. Gate Mask (The attention map itself, 0-1) - NEW
+    # This helps diagnose if the gate is learning a good mask.
+    if use_gate and gate_masks:
+        plot_data.append(("GateMask", gate_masks, "heatmap")) # direct heatmap
 
-        for i in range(n_cams):
-            img_np = _prep_img(imgs[i][sample_idx])
+    # 3. Gate Output (Feature * Mask)
+    if use_gate and "gate" in features and features["gate"]:
+        plot_data.append(("GateFeat", features["gate"], "norm"))
+        
+    # 4. CrossAttn (LookCloser)
+    if use_lc and "look_closer" in features and features["look_closer"]:
+        plot_data.append(("CrossAttn", features["look_closer"], "norm"))
 
-            # Raw feature activation
-            raw_heat = _feat_to_heatmap(raw_features[i][sample_idx])
-            raw_heat_up = _upsample(raw_heat, img_h, img_w)
+    # 5. Decoder Attention
+    dec_attn_maps = _process_decoder_attn(decoder_attn, n_cams, img_h, img_w)
+    if dec_attn_maps:
+        plot_data.append(("DecAttn", dec_attn_maps, "norm")) # Already processed to 2D
+        
+    # Calculate grid size
+    total_cols = 1 + len(plot_data)
+    
+    fig, axes = plt.subplots(n_cams, total_cols, figsize=(3 * total_cols, 3 * n_cams))
+    if n_cams == 1:
+        axes = axes[np.newaxis, :]
 
-            # Gated feature activation
-            gated_heat = _feat_to_heatmap(gated_features[i][sample_idx])
-            gated_heat_up = _upsample(gated_heat, img_h, img_w)
+    for cam_idx in range(n_cams):
+        # --- Column 0: Input Image ---
+        img_np = _prep_img(imgs[cam_idx][sample_idx])
+        axes[cam_idx, 0].imshow(img_np)
+        if cam_idx == 0: axes[cam_idx, 0].set_title("Input Image", fontsize=10, fontweight='bold')
+        axes[cam_idx, 0].axis("off")
 
-            # Spatial mask
-            spatial_mask = model.spatial_refine_gate.last_spatial_mask[sample_idx, 0].cpu().numpy()
-            mask_up = _upsample(spatial_mask, img_h, img_w)
+        # --- Feature Columns ---
+        for col_i, (label, data_list, viz_method) in enumerate(plot_data):
+            ax = axes[cam_idx, col_i + 1]
+            
+            if data_list is None or cam_idx >= len(data_list):
+                ax.axis("off")
+                continue
+            
+            # data_list[cam_idx] is (B, C, H, W) OR (B, H, W) if pre-processed
+            feat = data_list[cam_idx][sample_idx]
+            
+            # Prepare heatmap
+            if viz_method == "heatmap":
+                # It's already a single channel or 2D map (like Gate Mask or DecAttn)
+                if feat.ndim == 3 and feat.shape[0] == 1: 
+                    heatmap = feat[0].cpu().numpy()
+                elif feat.ndim == 2:
+                    heatmap = feat.cpu().numpy()
+                else: 
+                     # Unexpected
+                    heatmap = feat.mean(dim=0).cpu().numpy()
+            else: # "norm" or "mean"
+                heatmap = _feat_to_heatmap(feat, method=viz_method)
+            
+            # Normalize heatmap for display (unless it is a probability/mask [0,1])
+            # For GateMask (Sigmoid), it is already [0,1], but min_max helps visualization contrast 
+            # if values are clustered (e.g. all 0.4-0.5).
+            # But true 0-1 is better for "Mask".
+            if label == "GateMask":
+                # Don't normalize GateMask, show absolute strength
+                # It comes from Sigmoid so it is in [0, 1]
+                pass 
+            else:
+                heatmap = _min_max_norm(heatmap)
+            
+            heatmap_up = _upsample(heatmap, img_h, img_w)
+            
+            ax.imshow(img_np, alpha=1.0)
+            ax.imshow(heatmap_up, cmap="jet", alpha=0.6, vmin=0, vmax=1) 
+            # vmin/vmax=0/1 ensures GateMask is interpreted correctly as opacity
+            
+            if cam_idx == 0:
+                ax.set_title(label, fontsize=10, fontweight='bold')
+            ax.axis("off")
 
-            # Plot
-            axes1[i, 0].imshow(img_np)
-            axes1[i, 0].set_title(f"{short_names[i]}: Original", fontsize=9)
-            axes1[i, 0].axis("off")
+    plt.tight_layout()
+    out_file = save_path / f"{fname_prefix}_{step:06d}.png"
+    plt.savefig(out_file, dpi=150, bbox_inches='tight')
+    plt.close(fig)
 
-            _overlay(axes1[i, 1], img_np, mask_up,
-                     f"Spatial Gate Mask [{spatial_mask.min():.2f}, {spatial_mask.max():.2f}]",
-                     cmap="hot", vmin=0, vmax=1)
 
-            _overlay(axes1[i, 2], img_np, raw_heat_up,
-                     "Feature Activation (before Gate)")
+def _run_viz_forward_full(policy, batch):
+    model = policy.model
+    model.return_features_for_viz = True
+    
+    # --- Hook Decoder Attention ---
+    last_decoder_layer = model.decoder.layers[-1]
+    cross_attn_module = last_decoder_layer.multihead_attn
+    captured_dec = {}
+    
+    def hook_dec_fn(module, input, output):
+        # output is (attn_output, attn_weights)
+        if isinstance(output, tuple) and len(output) > 1:
+            captured_dec["weights"] = output[1]
+    
+    handle_dec = cross_attn_module.register_forward_hook(hook_dec_fn)
 
-            _overlay(axes1[i, 3], img_np, gated_heat_up,
-                     "Feature Activation (after Gate)")
+    # --- Hook Gate Mask (If exists) ---
+    captured_masks = []
+    handle_gate = None
+    
+    if hasattr(model, "spatial_refine_gate") and model.spatial_refine_gate is not None:
+        # Hook the 'spatial_gate' submodule which outputs the mask
+        # SpatialRefineGate structure: self.spatial_gate = nn.Sequential(...)
+        gate_module = model.spatial_refine_gate.spatial_gate
+        
+        def hook_gate_fn(module, input, output):
+            # output is the spatial mask (B, 1, H, W)
+            captured_masks.append(output.detach())
+            
+        handle_gate = gate_module.register_forward_hook(hook_gate_fn)
 
-        fig1.suptitle(f"SpatialRefineGate Effect (step {step})", fontsize=13, y=1.01)
-        fig1.tight_layout()
-        p1 = save_path / f"gate_effect_{step:04d}.png"
-        fig1.savefig(p1, dpi=150, bbox_inches="tight")
-        plt.close(fig1)
-        print(f"Saved: {p1}")
-
-    # =========================================================================
-    # Figure 2: Look Closer cross-view attention
-    # =========================================================================
-    has_lc = getattr(model, "use_look_closer", False)
-
-    if has_lc:
-        # Collect attention pairs: (name, attn_module, query_cam_idx, key_cam_idx)
-        lc_pairs = []
-        if hasattr(model, "lc_attn_h2l"):
-            lc_pairs.append(("head→wrist_l", model.lc_attn_h2l, 0, 1))
-            lc_pairs.append(("wrist_l→head", model.lc_attn_l2h, 1, 0))
-        if hasattr(model, "lc_attn_h2r") and n_cams >= 3:
-            lc_pairs.append(("head→wrist_r", model.lc_attn_h2r, 0, 2))
-            lc_pairs.append(("wrist_r→head", model.lc_attn_r2h, 2, 0))
-
-        # Fallback for old 2-cam naming (lc_attn_1, lc_attn_2)
-        if not lc_pairs:
-            if hasattr(model, "lc_attn_1"):
-                lc_pairs.append(("view0→view1", model.lc_attn_1, 0, 1))
-                lc_pairs.append(("view1→view0", model.lc_attn_2, 1, 0))
-
-        if lc_pairs:
-            n_pairs = len(lc_pairs)
-            fig2, axes2 = plt.subplots(n_pairs, 3, figsize=(15, 5 * n_pairs))
-            if n_pairs == 1:
-                axes2 = axes2[np.newaxis, :]
-
-            for row, (pair_name, attn_mod, q_idx, k_idx) in enumerate(lc_pairs):
-                attn_map = attn_mod.last_attention_map[sample_idx]  # (HW_k, HW_q)
-
-                img_q = _prep_img(imgs[q_idx][sample_idx])
-                img_k = _prep_img(imgs[k_idx][sample_idx])
-
-                # Global attention: sum over query dim -> heatmap on key
-                global_heat = attn_map.sum(dim=1).cpu().numpy()  # (HW_k,)
-                hw_k = global_heat.shape[0]
-                # Infer spatial dims (may not be square)
-                # Use the feature map shape from raw_features if available
-                if has_gate and k_idx < len(raw_features):
-                    hf_k, wf_k = raw_features[k_idx].shape[2], raw_features[k_idx].shape[3]
+    # --- Run Forward ---
+    with torch.no_grad():
+        policy.predict_action_chunk(batch)
+    
+    # Cleanup Hooks
+    handle_dec.remove()
+    if handle_gate:
+        handle_gate.remove()
+    
+    # --- Collect Features ---
+    feats = {}
+    if hasattr(model, "viz_features"):
+        for k, v in model.viz_features.items():
+            if isinstance(v, list):
+                if len(v) > 0 and isinstance(v[0], torch.Tensor):
+                    feats[k] = [x.detach() for x in v]
                 else:
-                    hf_k = wf_k = int(np.sqrt(hw_k))
-                global_heat = global_heat.reshape(hf_k, wf_k)
-                global_heat_up = _upsample(global_heat, img_h, img_w)
+                    feats[k] = v 
+            elif isinstance(v, torch.Tensor):
+                feats[k] = v.detach()
+    
+    model.return_features_for_viz = False
+    
+    return feats, captured_dec.get("weights"), captured_masks
+def _process_decoder_attn(attn_weights, n_cams, img_h, img_w):
+    """
+    attn_weights: (B, Chunk_Size, Seq_Enc)
+    Seq_Enc includes Latent(1) + Robot(1) + Env(1) + Images(N*H*W).
+    We need to extract the Image part and reshape.
+    """
+    if attn_weights is None:
+        return None
+        
+    # Average attention across all Action Chunk queries (temporal average)
+    # (B, Seq_Enc)
+    attn_avg = attn_weights.mean(dim=1) 
+    
+    # Remove non-image tokens. 
+    # Usually first 1 (latent), +1 (robot state), maybe +1 (env state).
+    # This depends on config. 
+    # Let's assume standard ACT: Latent + RobotState.
+    # But strictly we should calculate.
+    # Seq_Enc len = M. 
+    # Image tokens = N_cams * H_feat * W_feat.
+    # The suffix is image tokens.
+    
+    # H_feat, W_feat? We need to infer from total length or pass in backbone feat size.
+    # Let's guess 15x20 (480x640 / 32).
+    # Better: H_feat = ceil(img_h / 32), W_feat = ceil(img_w / 32) for ResNet18/34/50
+    # Actually, let's use the known n_cams. 
+    # M = offset + n_cams * feat_pixels.
+    
+    seq_len = attn_avg.shape[1]
+    
+    # Estimate standard feat size (ResNet stride 32)
+    fh = int(np.ceil(img_h / 32))
+    fw = int(np.ceil(img_w / 32))
+    img_tokens_count = n_cams * fh * fw
+    
+    # If mismatch, try strict division
+    if img_tokens_count > seq_len:
+        # Maybe stride is different or something
+        # Try finding offset
+        # common offsets: 1, 2, 3.
+        # Let's try to fit.
+        valid = False
+        for off in [1, 2, 3]:
+            rem = seq_len - off
+            if rem % n_cams == 0:
+                pix = rem // n_cams
+                # is pix square-ish?
+                ratio = img_w / img_h
+                # w_feat / h_feat ~ ratio
+                # w * h = pix
+                # w = h * ratio -> h^2 * ratio = pix -> h = sqrt(pix/ratio)
+                h_est = int(np.sqrt(pix / ratio))
+                w_est = pix // h_est
+                if h_est * w_est == pix:
+                    fh, fw = h_est, w_est
+                    offset = off
+                    valid = True
+                    break
+        if not valid:
+            return None # Cannot reshape
+    else:
+        offset = seq_len - img_tokens_count
+    
+    # Slice image tokens
+    attn_img = attn_avg[:, offset:] # (B, Img_Tokens)
+    
+    maps = []
+    pix_per_cam = fh * fw
+    for i in range(n_cams):
+        start = i * pix_per_cam
+        end = (i+1) * pix_per_cam
+        cam_attn = attn_img[:, start:end] # (B, H*W)
+        cam_map = cam_attn.view(-1, fh, fw) # (B, fh, fw)
+        maps.append(cam_map) # List of (B, H, W)
+        
+    return maps
 
-                # Point attention: pick center of query feature map
-                if has_gate and q_idx < len(raw_features):
-                    hf_q, wf_q = raw_features[q_idx].shape[2], raw_features[q_idx].shape[3]
-                else:
-                    hw_q = attn_map.shape[1]
-                    hf_q = wf_q = int(np.sqrt(hw_q))
-                center_q = (hf_q // 2) * wf_q + (wf_q // 2)
-                point_heat = attn_map[:, center_q].cpu().numpy().reshape(hf_k, wf_k)
-                point_heat_up = _upsample(point_heat, img_h, img_w)
-
-                # Plot: query img | global attn on key | point attn on key
-                axes2[row, 0].imshow(img_q)
-                axes2[row, 0].set_title(f"{pair_name}: Query ({short_names[q_idx]})", fontsize=9)
-                # Mark center point on query image
-                cy = int((hf_q // 2) / hf_q * img_h)
-                cx = int((wf_q // 2) / wf_q * img_w)
-                axes2[row, 0].plot(cx, cy, "r+", markersize=15, markeredgewidth=2)
-                axes2[row, 0].axis("off")
-
-                _overlay(axes2[row, 1], img_k, global_heat_up,
-                         f"Global Attn on {short_names[k_idx]}")
-
-                _overlay(axes2[row, 2], img_k, point_heat_up,
-                         f"Point Attn on {short_names[k_idx]} (from center)")
-
-            fig2.suptitle(f"Look Closer Cross-View Attention (step {step})", fontsize=13, y=1.01)
-            fig2.tight_layout()
-            p2 = save_path / f"cross_view_attn_{step:04d}.png"
-            fig2.savefig(p2, dpi=150, bbox_inches="tight")
-            plt.close(fig2)
-            print(f"Saved: {p2}")
-
-    # =========================================================================
-    # Figure 3: Channel attention weight distribution
-    # =========================================================================
-    if has_gate:
-        ca_weight = model.spatial_refine_gate.last_channel_weight[sample_idx, :, 0, 0].cpu().numpy()
-
-        fig3, ax3 = plt.subplots(1, 1, figsize=(10, 3))
-        ax3.bar(range(len(ca_weight)), sorted(ca_weight, reverse=True), width=1.0, color="steelblue")
-        ax3.set_xlabel("Channel (sorted by weight)")
-        ax3.set_ylabel("Gate weight")
-        ax3.set_title(f"Channel Attention Distribution (step {step}) — "
-                      f"min={ca_weight.min():.3f}, max={ca_weight.max():.3f}, "
-                      f"mean={ca_weight.mean():.3f}")
-        fig3.tight_layout()
-        p3 = save_path / f"channel_attn_{step:04d}.png"
-        fig3.savefig(p3, dpi=150)
-        plt.close(fig3)
-        print(f"Saved: {p3}")
-
-    print(f"\nAll visualizations saved to {save_path}/")
 
 
-if __name__ == "__main__":
-    print("Usage:")
-    print("  from lerobot.policies.act.visualize_look_closer import visualize_act_vision")
-    print("  visualize_act_vision(policy, batch, save_dir='viz_output', step=0)")
+def _process_encoder_out(encoder_out, n_cams, backbone_feats):
+    if encoder_out is None or not backbone_feats:
+        return None
+    
+    feat_sample = backbone_feats[0] 
+    feat_h, feat_w = feat_sample.shape[2], feat_sample.shape[3]
+    
+    # encoder_out: (B, Seq, D)
+    enc_T = encoder_out.transpose(1, 2) # (B, D, Seq)
+    
+    pixels_per_cam = feat_h * feat_w
+    
+    if enc_T.shape[2] != n_cams * pixels_per_cam:
+        # Fallback/Error check
+        return None
+        
+    enc_cam_features = []
+    
+    for i in range(n_cams):
+        start = i * pixels_per_cam
+        end = (i+1) * pixels_per_cam
+        cam_toks = enc_T[:, :, start:end] # (B, D, H*W)
+        cam_feat = cam_toks.view(-1, cam_toks.shape[1], feat_h, feat_w)
+        enc_cam_features.append(cam_feat)
+        
+    return enc_cam_features

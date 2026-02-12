@@ -430,12 +430,16 @@ class ACT(nn.Module):
 
             # IMPROVEMENT: Spatial Refine Gate - per-view feature refinement
             feature_dim = backbone_model.fc.in_features
-            self.spatial_refine_gate = SpatialRefineGate(feature_dim)
+            
+            if config.use_spatial_refine_gate:
+                self.spatial_refine_gate = SpatialRefineGate(feature_dim)
+            else:
+                self.spatial_refine_gate = None
 
             # IMPROVEMENT: Look Closer modules
             # Cross-view attention: head_cam ←→ each wrist cam
             n_cams = len(self.config.image_features)
-            if n_cams >= 2:
+            if config.use_look_closer and n_cams >= 2:
                 self.use_look_closer = True
 
                 # Pair 1: head ←→ wrist_l (indices 0, 1)
@@ -622,9 +626,28 @@ class ACT(nn.Module):
 
             # IMPROVEMENT PREPARATION: Collect features first, then refine per-view
             image_features_list = []
+            
+            # Visualization initialization
+            capture_viz = getattr(self, "return_features_for_viz", False)
+            if capture_viz:
+                self.viz_features = {"backbone": [], "gate": [], "look_closer": []}
+
+            # Helper to safely call gate
+            use_gate = hasattr(self, "spatial_refine_gate") and self.spatial_refine_gate is not None
+            
             for img in batch[OBS_IMAGES]:
                 feat = self.backbone(img)["feature_map"]
-                feat = self.spatial_refine_gate(feat)
+                
+                # capture backbone output
+                if capture_viz:
+                    self.viz_features["backbone"].append(feat)
+
+                if use_gate:
+                    feat = self.spatial_refine_gate(feat)
+                    # capture gate output
+                    if capture_viz:
+                        self.viz_features["gate"].append(feat)
+                
                 image_features_list.append(feat)
 
             # IMPROVEMENT: Look Closer mixing
@@ -646,6 +669,10 @@ class ACT(nn.Module):
                     wr = self._lc_block(wr, head, self.lc_attn_r2h, self.lc_norm_r2h, self.lc_mlp_r2h)
                     image_features_list[0] = head
                     image_features_list[2] = wr
+            
+            # Capture final LookCloser state (or just the state before projection if LC not used)
+            if capture_viz:
+                self.viz_features["look_closer"] = [x for x in image_features_list]
 
             for cam_features in image_features_list:
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
@@ -668,6 +695,22 @@ class ACT(nn.Module):
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+
+        # [DEBUG VISUALIZATION EXTRACTOR]
+        # 如果需要可视化，可以在这里从 encoder_out 中把图像特征还原出来
+        # encoder_out shape: (seq_len, batch, dim)
+        # 序列结构: [latent(1) + robot_state(1?) + env_state(1?) + images(H*W*N)]
+        # 我们假设 images 在最后（这是 ACT 的标准做法）
+        if getattr(self, "return_features_for_viz", False):
+            # 计算非图像 token 的数量
+            n_non_image = 1 # latent
+            if self.config.robot_state_feature: n_non_image += 1
+            if self.config.env_state_feature: n_non_image += 1
+            
+            # 提取图像部分的输出 (Seq_img, B, D)
+            img_encoder_out = encoder_out[n_non_image:]
+            self.viz_features["encoder_out"] = img_encoder_out.permute(1, 0, 2) # B, Seq, D
+
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
