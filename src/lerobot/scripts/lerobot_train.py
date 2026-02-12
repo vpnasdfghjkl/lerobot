@@ -339,12 +339,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
+        # When memory is enabled, frames must be in sequential order for the memory bank
+        use_memory = getattr(cfg.policy, "use_memory", False)
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=True,
+            shuffle=not use_memory,
         )
     else:
         shuffle = True

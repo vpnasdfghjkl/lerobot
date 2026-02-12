@@ -94,6 +94,17 @@ class PI0Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # MemoryVLA settings
+    use_memory: bool = False
+    memory_length: int = 16
+    memory_retrieval_layers: int = 2
+    memory_fusion_type: str = "gate"
+    memory_consolidate_type: str = "fifo"
+
+    # Drop last N frames per episode (enables EpisodeAwareSampler in training script;
+    # also needed when use_memory=True so the sampler groups frames by episode)
+    drop_n_last_frames: int = 0
+
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
 
     def __post_init__(self):
@@ -113,6 +124,10 @@ class PI0Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        # When memory is enabled, ensure drop_n_last_frames is set for EpisodeAwareSampler
+        if self.use_memory and self.drop_n_last_frames == 0:
+            self.drop_n_last_frames = self.chunk_size
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

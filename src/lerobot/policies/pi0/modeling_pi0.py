@@ -44,6 +44,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi0.configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+from lerobot.policies.pi0.memory_module import CogMemBank
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -559,6 +560,27 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
+        # Initialize MemoryVLA Bank
+        if config.use_memory:
+            # token_size matches VLM embedding dimension (gemma_300m=1024, gemma_2b=2048)
+            mem_token_size = paligemma_config.width
+
+            self.cog_mem_bank = CogMemBank(
+                dataloader_type='stream',
+                token_size=mem_token_size,
+                mem_length=config.memory_length,
+                retrieval_layers=config.memory_retrieval_layers,
+                fusion_type=config.memory_fusion_type,
+                consolidate_type=config.memory_consolidate_type,
+                use_timestep_pe=True,
+            )
+
+            # Match memory bank dtype to VLM precision
+            if config.dtype == "bfloat16":
+                self.cog_mem_bank = self.cog_mem_bank.to(dtype=torch.bfloat16)
+        else:
+            self.cog_mem_bank = None
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -585,6 +607,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+    def reset(self):
+        """Reset the internal state of the model (e.g. memory bank)."""
+        if self.cog_mem_bank is not None:
+            self.cog_mem_bank.reset()
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -635,7 +662,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, episode_ids=None, episode_timesteps=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -654,6 +681,34 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
+
+        # --- MemoryVLA Integration ---
+        if self.cog_mem_bank is not None and len(embs) > 0:
+            # Concatenate all image embeddings to process them as a single sequence in memory
+            # This allows cross-camera attention if multiple cameras are present
+            merged_img_embs = torch.cat(embs, dim=1)
+            merged_pad_masks = torch.cat(pad_masks, dim=1)
+
+            # Apply Memory Bank
+            merged_img_embs = self.cog_mem_bank(
+                merged_img_embs,
+                episode_ids=episode_ids,
+                timesteps=episode_timesteps
+            )
+
+            # Replace individual image embeddings with the fused/memory-augmented features
+            embs = [merged_img_embs]
+            pad_masks = [merged_pad_masks]
+            
+            # Reconstruct attention masks
+            # Since we merged all image tokens, they are now a single block.
+            # In embedding space, they correspond to valid tokens (0) or padding (1). 
+            # But here att_masks is used for bias 2d mask creation. 
+            # Original logic: att_masks += [0] * num_img_embs (for each image).
+            # So the total length matches the token count.
+            # We just need a list of zeros matching the new total length.
+            att_masks = [0] * merged_img_embs.shape[1]
+        # -----------------------------
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -741,7 +796,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
+        episode_ids=None, episode_timesteps=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
@@ -755,7 +811,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
@@ -767,6 +823,12 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+
+        # Cast att_masks to consistent int64 type before concat
+        # (prefix is bool from embed_prefix, suffix is float from embed_suffix)
+        prefix_att_masks = prefix_att_masks.to(torch.int64)
+        suffix_att_masks = suffix_att_masks.to(torch.int64)
+        
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
@@ -827,8 +889,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
+        episode_ids = kwargs.get("episode_ids", None)
+        episode_timesteps = kwargs.get("episode_timesteps", None)
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1276,8 +1341,17 @@ class PI0Policy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
 
+        # Extract memory-related info from batch if available
+        episode_ids = batch.get("episode_index", None)
+
+        # 'frame_index' denotes time within episode (preferred for timestep PE)
+        episode_timesteps = batch.get("frame_index", batch.get("timestamp", None))
+
         # Compute loss
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
+        losses = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions,
+            episode_ids=episode_ids, episode_timesteps=episode_timesteps
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
