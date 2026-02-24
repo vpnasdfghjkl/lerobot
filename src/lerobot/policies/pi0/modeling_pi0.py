@@ -45,6 +45,7 @@ from lerobot.policies.pi0.configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.pi0.memory_module import CogMemBank, PerMemBank
+from lerobot.policies.pi0.scene_encoder import SceneAnchor
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -58,6 +59,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    scene_features: Tensor | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -588,6 +590,19 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         else:
             self.cog_mem_bank = None
 
+        # SceneAnchor — multi-view scene prior (MVCNN-style, SigLIP feature space)
+        if config.use_scene_anchor:
+            self.scene_anchor = SceneAnchor(
+                embed_dim=paligemma_config.width,
+                n_tokens=config.scene_token_length,
+                compress_mode=config.scene_compress_mode,
+                perceiver_depth=config.scene_perceiver_depth,
+            )
+            if config.dtype == "bfloat16":
+                self.scene_anchor = self.scene_anchor.to(dtype=torch.bfloat16)
+        else:
+            self.scene_anchor = None
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -671,7 +686,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, episode_ids=None, episode_timesteps=None
+        self, images, img_masks, lang_tokens, lang_masks, episode_ids=None, episode_timesteps=None,
+        scene_features=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -705,6 +721,17 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             embs = [merged_img_embs]
             pad_masks = [merged_pad_masks]
             att_masks = [0] * merged_img_embs.shape[1]
+        # ---------------------------------------------------------------
+
+        # --- SceneAnchor: multi-view scene tokens (same SigLIP space as img tokens) ---
+        # Placed between image and language tokens so self-attention naturally
+        # attends between observation ↔ scene ↔ language.
+        if self.scene_anchor is not None and scene_features is not None:
+            scene_tokens = self.scene_anchor(scene_features)  # (B, N_scene, D)
+            bsize_scene = scene_tokens.shape[0]
+            embs.append(scene_tokens)
+            pad_masks.append(torch.ones(bsize_scene, scene_tokens.shape[1], dtype=torch.bool, device=scene_tokens.device))
+            att_masks += [0] * scene_tokens.shape[1]
         # ---------------------------------------------------------------
 
         # Process language tokens
@@ -802,7 +829,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
-        episode_ids=None, episode_timesteps=None
+        episode_ids=None, episode_timesteps=None, scene_features=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
@@ -816,7 +843,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps
+            images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps,
+            scene_features=scene_features,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
@@ -905,9 +933,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         episode_ids = kwargs.get("episode_ids", None)
         episode_timesteps = kwargs.get("episode_timesteps", None)
+        scene_features = kwargs.get("scene_features", None)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps
+            images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps,
+            scene_features=scene_features,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1350,6 +1380,10 @@ class PI0Policy(PreTrainedPolicy):
             kwargs["episode_timesteps"] = [self._inference_timestep] * bsize
             self._inference_timestep += 1
 
+        # Pass scene features if available in batch
+        if self.config.use_scene_anchor and "observation.scene_features" in batch:
+            kwargs["scene_features"] = batch["observation.scene_features"]
+
         # Sample actions using the model (pass through RTC kwargs)
         actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, **kwargs)
 
@@ -1380,10 +1414,14 @@ class PI0Policy(PreTrainedPolicy):
         # 'frame_index' denotes time within episode (preferred for timestep PE)
         episode_timesteps = batch.get("frame_index", batch.get("timestamp", None))
 
+        # Extract scene features if scene anchor is enabled
+        scene_features = batch.get("observation.scene_features", None)
+
         # Compute loss
         losses = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, state, actions,
-            episode_ids=episode_ids, episode_timesteps=episode_timesteps
+            episode_ids=episode_ids, episode_timesteps=episode_timesteps,
+            scene_features=scene_features,
         )
 
         # Truncate losses to actual action dimensions

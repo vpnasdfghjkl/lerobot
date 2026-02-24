@@ -107,6 +107,12 @@ class PI0Config(PreTrainedConfig):
                                             # 0.0 = equal mix (MemoryVLA default).
                                             # 2.0 → sigmoid(2)≈0.88, conservative start.
 
+    # SceneAnchor — multi-view scene prior (MVCNN-style, SigLIP feature space)
+    use_scene_anchor: bool = False         # Enable scene anchor module
+    scene_token_length: int = 64           # Number of output scene tokens
+    scene_compress_mode: str = "perceiver" # 'pool' (lightweight) or 'perceiver' (expressive)
+    scene_perceiver_depth: int = 2         # Cross-attention layers (perceiver mode only)
+
     # Drop last N frames per episode (enables EpisodeAwareSampler in training script;
     # also needed when use_memory=True so the sampler groups frames by episode)
     drop_n_last_frames: int = 0
@@ -134,6 +140,13 @@ class PI0Config(PreTrainedConfig):
         # Cog memory requires per memory to be enabled
         if self.use_cog_memory and not self.use_memory:
             raise ValueError("use_cog_memory=True requires use_memory=True")
+
+        # Validate scene anchor configuration
+        if self.use_scene_anchor:
+            if self.scene_compress_mode not in ("pool", "perceiver"):
+                raise ValueError(f"Invalid scene_compress_mode: {self.scene_compress_mode}")
+            if self.scene_token_length <= 0:
+                raise ValueError(f"scene_token_length must be positive, got {self.scene_token_length}")
 
         # When memory is enabled, ensure drop_n_last_frames is set for EpisodeAwareSampler
         if self.use_memory and self.drop_n_last_frames == 0:
