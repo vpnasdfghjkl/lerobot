@@ -94,12 +94,18 @@ class PI0Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
-    # MemoryVLA settings
-    use_memory: bool = False
+    # MemoryVLA settings — dual-track memory (Per + Cog)
+    use_memory: bool = False              # Enable perception memory (PerMemBank, pre-LLM)
+    use_cog_memory: bool = False          # Enable cognition memory (CogMemBank, post-LLM)
     memory_length: int = 16
     memory_retrieval_layers: int = 2
     memory_fusion_type: str = "gate"
-    memory_consolidate_type: str = "fifo"
+    memory_consolidate_type: str = "tome"
+    memory_dataloader_type: str = "stream"   # 'stream' or 'group'
+    memory_group_size: int = 16
+    memory_gate_init_bias: float = 2.0      # GateFusion init bias: >0 favors original obs,
+                                            # 0.0 = equal mix (MemoryVLA default).
+                                            # 2.0 → sigmoid(2)≈0.88, conservative start.
 
     # Drop last N frames per episode (enables EpisodeAwareSampler in training script;
     # also needed when use_memory=True so the sampler groups frames by episode)
@@ -124,6 +130,10 @@ class PI0Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        # Cog memory requires per memory to be enabled
+        if self.use_cog_memory and not self.use_memory:
+            raise ValueError("use_cog_memory=True requires use_memory=True")
 
         # When memory is enabled, ensure drop_n_last_frames is set for EpisodeAwareSampler
         if self.use_memory and self.drop_n_last_frames == 0:

@@ -44,7 +44,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi0.configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
-from lerobot.policies.pi0.memory_module import CogMemBank
+from lerobot.policies.pi0.memory_module import CogMemBank, PerMemBank
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -560,22 +560,29 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
-        # Initialize MemoryVLA Bank
+        # Initialize MemoryVLA Banks (dual-track: Per + Cog)
+        mem_token_size = paligemma_config.width
+        mem_bank_kwargs = dict(
+            dataloader_type=config.memory_dataloader_type,
+            group_size=config.memory_group_size,
+            token_size=mem_token_size,
+            mem_length=config.memory_length,
+            retrieval_layers=config.memory_retrieval_layers,
+            fusion_type=config.memory_fusion_type,
+            consolidate_type=config.memory_consolidate_type,
+            use_timestep_pe=True,
+            gate_init_bias=config.memory_gate_init_bias,
+        )
+
         if config.use_memory:
-            # token_size matches VLM embedding dimension (gemma_300m=1024, gemma_2b=2048)
-            mem_token_size = paligemma_config.width
+            self.per_mem_bank = PerMemBank(**mem_bank_kwargs)
+            if config.dtype == "bfloat16":
+                self.per_mem_bank = self.per_mem_bank.to(dtype=torch.bfloat16)
+        else:
+            self.per_mem_bank = None
 
-            self.cog_mem_bank = CogMemBank(
-                dataloader_type='stream',
-                token_size=mem_token_size,
-                mem_length=config.memory_length,
-                retrieval_layers=config.memory_retrieval_layers,
-                fusion_type=config.memory_fusion_type,
-                consolidate_type=config.memory_consolidate_type,
-                use_timestep_pe=True,
-            )
-
-            # Match memory bank dtype to VLM precision
+        if config.use_cog_memory:
+            self.cog_mem_bank = CogMemBank(**mem_bank_kwargs)
             if config.dtype == "bfloat16":
                 self.cog_mem_bank = self.cog_mem_bank.to(dtype=torch.bfloat16)
         else:
@@ -609,7 +616,9 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             raise ValueError(msg) from None
 
     def reset(self):
-        """Reset the internal state of the model (e.g. memory bank)."""
+        """Reset the internal state of the model (e.g. memory banks)."""
+        if self.per_mem_bank is not None:
+            self.per_mem_bank.reset()
         if self.cog_mem_bank is not None:
             self.cog_mem_bank.reset()
 
@@ -682,33 +691,21 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
 
-        # --- MemoryVLA Integration ---
-        if self.cog_mem_bank is not None and len(embs) > 0:
-            # Concatenate all image embeddings to process them as a single sequence in memory
-            # This allows cross-camera attention if multiple cameras are present
+        # --- PerMemBank: perception-level memory on SigLIP visual features ---
+        if self.per_mem_bank is not None and len(embs) > 0:
             merged_img_embs = torch.cat(embs, dim=1)
             merged_pad_masks = torch.cat(pad_masks, dim=1)
 
-            # Apply Memory Bank
-            merged_img_embs = self.cog_mem_bank(
-                merged_img_embs,
+            merged_img_embs = self.per_mem_bank.process_batch(
+                tokens=merged_img_embs,
                 episode_ids=episode_ids,
-                timesteps=episode_timesteps
+                timesteps=episode_timesteps,
             )
 
-            # Replace individual image embeddings with the fused/memory-augmented features
             embs = [merged_img_embs]
             pad_masks = [merged_pad_masks]
-            
-            # Reconstruct attention masks
-            # Since we merged all image tokens, they are now a single block.
-            # In embedding space, they correspond to valid tokens (0) or padding (1). 
-            # But here att_masks is used for bias 2d mask creation. 
-            # Original logic: att_masks += [0] * num_img_embs (for each image).
-            # So the total length matches the token count.
-            # We just need a list of zeros matching the new total length.
             att_masks = [0] * merged_img_embs.shape[1]
-        # -----------------------------
+        # ---------------------------------------------------------------
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -729,6 +726,14 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+        # --- CogMemBank: retrieve cognition memory to augment prefix_embs ---
+        if self.cog_mem_bank is not None:
+            embs = self.cog_mem_bank.retrieve_and_fuse(
+                query_tokens=embs,
+                episode_ids=episode_ids,
+            )
+        # -------------------------------------------------------------------
 
         return embs, pad_masks, att_masks
 
@@ -837,7 +842,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -845,11 +850,20 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
+
+        # --- CogMemBank: store post-LLM prefix features for next frame ---
+        if self.cog_mem_bank is not None:
+            self.cog_mem_bank.store_batch(
+                tokens=prefix_out,
+                episode_ids=episode_ids,
+                timesteps=episode_timesteps,
+            )
+        # -----------------------------------------------------------------
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -901,13 +915,22 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        [prefix_out, _], past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        # --- CogMemBank: store post-LLM prefix features for next step ---
+        if self.cog_mem_bank is not None:
+            self.cog_mem_bank.store_batch(
+                tokens=prefix_out,
+                episode_ids=episode_ids,
+                timesteps=episode_timesteps,
+            )
+        # -----------------------------------------------------------------
 
         dt = -1.0 / num_steps
 
@@ -1198,6 +1221,9 @@ class PI0Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        # Reset memory bank and inference timestep counter
+        self.model.reset()
+        self._inference_timestep = 0
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1316,6 +1342,13 @@ class PI0Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
+
+        # Pass memory context for inference (episode_id=0, auto-incrementing timestep)
+        if self.config.use_memory:
+            bsize = state.shape[0]
+            kwargs["episode_ids"] = [0] * bsize
+            kwargs["episode_timesteps"] = [self._inference_timestep] * bsize
+            self._inference_timestep += 1
 
         # Sample actions using the model (pass through RTC kwargs)
         actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, **kwargs)
