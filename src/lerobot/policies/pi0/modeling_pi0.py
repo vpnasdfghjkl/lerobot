@@ -473,6 +473,19 @@ class PaliGemmaWithExpertModel(
             prefix_output = None
             prefix_past_key_values = None
         else:
+            # NOTE: Active implementation = layer-wise coupled VLM + action expert path.
+            # The commented block below provides a drop-in alternative implementation:
+            # "Pure VLM backbone + Action expert" (prefix cache + suffix expert).
+            #
+            # Switching guide:
+            # 1) Comment out the active coupled block.
+            # 2) Uncomment the alternative block below.
+            # 3) Keep interface unchanged: return [prefix_output, suffix_output], prefix_past_key_values.
+            #
+            # Safety notes for the alternative block:
+            # - Cast prefix/suffix attention masks to match inputs_embeds dtype.
+            # - During training, temporarily disable language_model.gradient_checkpointing
+            #   before use_cache=True prefix pass, then restore it.
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
