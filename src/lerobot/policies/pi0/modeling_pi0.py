@@ -531,6 +531,51 @@ class PaliGemmaWithExpertModel(
 
             prefix_output = outputs_embeds[0]
             suffix_output = outputs_embeds[1]
+
+            # ---- Alternative (replace active block above): Pure VLM backbone + Action expert ----
+            # prefix_len = inputs_embeds[0].shape[1]
+
+            # prefix_attention_mask = attention_mask[:, :, :prefix_len, :prefix_len]
+            # prefix_attention_mask = prefix_attention_mask.to(dtype=inputs_embeds[0].dtype)
+            # prefix_position_ids = position_ids[:, :prefix_len]
+
+            # lang_model_gradient_checkpointing = getattr(
+            #     self.paligemma.language_model, "gradient_checkpointing", False
+            # )
+            # if lang_model_gradient_checkpointing and self.training:
+            #     self.paligemma.language_model.gradient_checkpointing = False
+
+            # try:
+            #     prefix_output_obj = self.paligemma.language_model.forward(
+            #         inputs_embeds=inputs_embeds[0],
+            #         attention_mask=prefix_attention_mask,
+            #         position_ids=prefix_position_ids,
+            #         past_key_values=None,
+            #         use_cache=True,
+            #         adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+            #     )
+            # finally:
+            #     if lang_model_gradient_checkpointing and self.training:
+            #         self.paligemma.language_model.gradient_checkpointing = True
+
+            # prefix_output = prefix_output_obj.last_hidden_state
+            # prefix_past_key_values = prefix_output_obj.past_key_values
+
+            # suffix_attention_mask = attention_mask[:, :, prefix_len:, :]
+            # suffix_attention_mask = suffix_attention_mask.to(dtype=inputs_embeds[1].dtype)
+            # suffix_position_ids = position_ids[:, prefix_len:]
+
+            # suffix_output_obj = self.gemma_expert.model.forward(
+            #     inputs_embeds=inputs_embeds[1],
+            #     attention_mask=suffix_attention_mask,
+            #     position_ids=suffix_position_ids,
+            #     past_key_values=prefix_past_key_values,
+            #     use_cache=False,
+            #     adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+            # )
+            # suffix_output = suffix_output_obj.last_hidden_state
+            # ---- End alternative ----
+            
             prefix_past_key_values = None
 
         return [prefix_output, suffix_output], prefix_past_key_values
