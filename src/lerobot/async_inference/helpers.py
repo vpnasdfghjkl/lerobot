@@ -287,6 +287,8 @@ def observations_similar(
     An immediate next step is to use (fast) perceptual difference metrics comparing some camera views,
     to surpass this joint-space similarity check.
     """
+    _logger = logging.getLogger(__name__)
+
     obs1_state = extract_state_from_raw_observation(
         make_lerobot_observation(obs1.get_observation(), lerobot_features)
     )
@@ -294,4 +296,14 @@ def observations_similar(
         make_lerobot_observation(obs2.get_observation(), lerobot_features)
     )
 
-    return _compare_observation_states(obs1_state, obs2_state, atol=atol)
+    similar = _compare_observation_states(obs1_state, obs2_state, atol=atol)
+    if similar:
+        dist = float(torch.linalg.norm(obs1_state - obs2_state))
+        _logger.info(f"obs1_state: {obs1_state.cpu().numpy()}")
+        _logger.info(f"obs2_state: {obs2_state.cpu().numpy()}")
+        _logger.info(
+            f"[FILTER] obs#{obs1.get_timestep()} REJECTED: too similar to last processed obs "
+            f"(dist={dist:.4f}, atol={atol}, last_obs=#{obs2.get_timestep()})"
+        )
+
+    return similar

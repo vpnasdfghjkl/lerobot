@@ -57,7 +57,9 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    extract_state_from_raw_observation,
     get_logger,
+    make_lerobot_observation,
     observations_similar,
     raw_observation_to_observation,
 )
@@ -273,16 +275,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             predicted_timesteps = self._predicted_timesteps
 
         if obs.get_timestep() in predicted_timesteps:
-            self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
-            return False
-
-        elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
-            self.logger.debug(
-                f"Skipping observation #{obs.get_timestep()} - Observation too similar to last obs predicted!"
+            self.logger.info(
+                f"[FILTER] obs#{obs.get_timestep()} REJECTED: timestep already predicted "
+                f"(predicted_set={sorted(predicted_timesteps)})"
             )
             return False
 
+        elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features, atol=self.config.obs_similarity_atol):
+            return False
+
         else:
+            self.logger.info(f"[FILTER] obs#{obs.get_timestep()} PASSED sanity checks")
             return True
 
     def _enqueue_observation(self, obs: TimedObservation) -> bool:
@@ -295,20 +298,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             or self._obs_sanity_checks(obs, self.last_processed_obs)
         ):
             last_obs = self.last_processed_obs.get_timestep() if self.last_processed_obs else "None"
-            self.logger.debug(
-                f"Enqueuing observation. Must go: {obs.must_go} | Last processed obs: {last_obs}"
+            self.logger.info(
+                f"[ENQUEUE] obs#{obs.get_timestep()} ENQUEUED (must_go={obs.must_go}, last_processed=#{last_obs})"
             )
 
             # If queue is full, get the old observation to make room
             if self.observation_queue.full():
                 # pops from queue
                 _ = self.observation_queue.get_nowait()
-                self.logger.debug("Observation queue was full, removed oldest observation")
+                self.logger.info("[ENQUEUE] Queue was full, removed oldest observation")
 
             # Now put the new observation (never blocks as queue is non-full here)
             self.observation_queue.put(obs)
             return True
 
+        self.logger.info(f"[ENQUEUE] obs#{obs.get_timestep()} DROPPED (not enqueued)")
         return False
 
     def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:

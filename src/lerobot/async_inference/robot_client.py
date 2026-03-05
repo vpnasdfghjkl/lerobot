@@ -403,7 +403,12 @@ class RobotClient:
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
         with self.action_queue_lock:
-            return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+            qs = self.action_queue.qsize()
+            cs = self.action_chunk_size
+            ready = qs / cs <= self._chunk_size_threshold
+            if ready:
+                self.logger.info(f"[DIAG-TRIGGER] obs send triggered: qsize={qs} chunk_size={cs} ratio={qs/cs:.3f} threshold={self._chunk_size_threshold}")
+            return ready
 
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
         try:

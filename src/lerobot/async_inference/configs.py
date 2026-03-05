@@ -64,6 +64,11 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # Observation filtering
+    obs_similarity_atol: float = field(
+        default=0.001, metadata={"help": "Tolerance for observation similarity check (joint-space distance)"}
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
