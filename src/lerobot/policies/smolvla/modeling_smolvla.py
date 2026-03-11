@@ -53,6 +53,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 """
 
 import math
+import random
 from collections import deque
 from typing import TypedDict
 
@@ -244,6 +245,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.config = config
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        self._reflow_teacher = None
+        self._reflow_data = None
+        self._reflow_index_map = None
+        if config.reflow_enabled and config.reflow_data_path is not None:
+            self._load_reflow_data(config.reflow_data_path)
         self.reset()
 
     def reset(self):
@@ -353,6 +359,89 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    def _load_reflow_data(self, path: str):
+        """Load pre-generated reflow (noise, action) pairs from disk."""
+        import logging
+        logger = logging.getLogger(__name__)
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        self._reflow_data = {
+            "reflow_noise": data["reflow_noise"],
+            "reflow_actions": data["reflow_actions"],
+        }
+        # Load index_map: dataset_sample_index -> position in reflow arrays
+        if "index_map" not in data:
+            raise ValueError(
+                f"Reflow data at {path} is missing 'index_map'. "
+                f"Regenerate with updated reflow_data_gen.py to ensure correct obs-reflow coupling."
+            )
+        self._reflow_index_map = data["index_map"]
+        logger.info(
+            f"Loaded reflow data from {path}: "
+            f"{self._reflow_data['reflow_noise'].shape[0]} pairs, "
+            f"action_dim={self._reflow_data['reflow_noise'].shape[-1]}, "
+            f"index_map entries={len(self._reflow_index_map)}"
+        )
+
+    def set_reflow_teacher(self, teacher_policy: "SmolVLAPolicy"):
+        """Set a frozen 1-RF teacher model for Reflow data generation."""
+        self._reflow_teacher = teacher_policy
+        self._reflow_teacher.eval()
+        for p in self._reflow_teacher.parameters():
+            p.requires_grad = False
+
+    @torch.no_grad()
+    def generate_reflow_targets(
+        self, batch: dict[str, Tensor], num_rollout_steps: int | None = None
+    ) -> dict[str, Tensor]:
+        """Generate (noise, predicted_action) pairs using the teacher model.
+
+        This implements Algorithm 2 (Reflow offline rollout) from the paper.
+        The teacher model runs a high-step ODE solve to produce pseudo-groundtruth
+        action targets that are causally coupled with the input noise.
+
+        Returns:
+            Dict with keys 'reflow_noise' and 'reflow_actions' added to a copy of batch.
+        """
+        teacher = self._reflow_teacher if self._reflow_teacher is not None else self
+        teacher.eval()
+
+        if num_rollout_steps is None:
+            num_rollout_steps = self.config.reflow_num_rollout_steps
+
+        # Temporarily override num_steps for high-precision teacher rollout
+        original_num_steps = teacher.config.num_steps
+        teacher.config.num_steps = num_rollout_steps
+
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        bsize = state.shape[0]
+        device = state.device
+        actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+        noise = teacher.model.sample_noise(actions_shape, device)
+
+        # High-step ODE solve (teacher rollout)
+        predicted_actions = teacher.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state,
+            noise=noise.clone(),
+        )
+
+        # Restore original num_steps
+        teacher.config.num_steps = original_num_steps
+
+        # Save full-dimensional (max_action_dim) noise and actions to preserve
+        # the exact ODE coupling. Truncating to original_action_dim and later
+        # padding with zeros would break the noise-action pairing.
+        return {
+            "reflow_noise": noise,
+            "reflow_actions": predicted_actions,
+        }
+
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
     ) -> dict[str, Tensor]:
@@ -374,10 +463,43 @@ class SmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+
+        has_reflow_in_batch = "reflow_noise" in batch and "reflow_actions" in batch
+        use_reflow = self.config.reflow_enabled and (has_reflow_in_batch or self._reflow_data is not None)
+
+        if use_reflow:
+            if has_reflow_in_batch:
+                reflow_noise = batch["reflow_noise"]
+                reflow_actions = batch["reflow_actions"]
+            else:
+                # Look up reflow pairs by dataset sample index to preserve obs-reflow coupling.
+                # index_map values can be int (single pass) or list[int] (multi-pass).
+                # For list, randomly pick one pair per sample for diversity.
+                sample_indices = batch["index"]
+                positions = []
+                for idx in sample_indices:
+                    entry = self._reflow_index_map[idx.item()]
+                    if isinstance(entry, list):
+                        positions.append(random.choice(entry))
+                    else:
+                        positions.append(entry)
+                positions = torch.tensor(positions, dtype=torch.long)
+                reflow_noise = self._reflow_data["reflow_noise"][positions].to(state.device)
+                reflow_actions = self._reflow_data["reflow_actions"][positions].to(state.device)
+
+            # reflow data is already in full max_action_dim space (no padding needed)
+            losses = self.model.forward_reflow(
+                images, img_masks, lang_tokens, lang_masks, state,
+                reflow_noise, reflow_actions, time
+            )
+        else:
+            # Standard 1-RF training
+            actions = self.prepare_action(batch)
+            losses = self.model.forward(
+                images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+            )
         loss_dict["losses_after_forward"] = losses.clone()
 
         if actions_is_pad is not None:
@@ -786,6 +908,51 @@ class VLAFlowMatching(nn.Module):
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        return losses
+
+    def forward_reflow(
+        self, images, img_masks, lang_tokens, lang_masks, state,
+        reflow_noise: Tensor, reflow_actions: Tensor, time=None
+    ) -> Tensor:
+        """2-RF training forward: regress velocity field along the straight line
+        connecting anchored noise and teacher-predicted actions.
+
+        Args:
+            reflow_noise: Anchored noise from teacher rollout (B, T_chunk, D).
+            reflow_actions: Teacher-predicted actions (B, T_chunk, D).
+            time: Optional time tensor; sampled from Beta distribution if None.
+        """
+        if time is None:
+            time = self.sample_time(reflow_noise.shape[0], reflow_noise.device)
+
+        time_expanded = time[:, None, None]
+        # Linear interpolation between noise (t=1) and predicted actions (t=0)
+        x_t = time_expanded * reflow_noise + (1 - time_expanded) * reflow_actions
+        # Constant target velocity field: noise - predicted_actions
+        u_t = reflow_noise - reflow_actions
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
