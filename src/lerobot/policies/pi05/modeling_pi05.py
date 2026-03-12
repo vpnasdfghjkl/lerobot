@@ -41,6 +41,7 @@ else:
     PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.memory import MemoryIntegration
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
@@ -56,6 +57,8 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    episode_ids: list | None
+    episode_timesteps: list | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -557,6 +560,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
+        # Initialize MemoryVLA (dual-track: Per + Cog) via shared integration
+        self.memory = MemoryIntegration(config.memory, token_size=paligemma_config.width, dtype=config.dtype)
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -631,8 +637,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    def reset(self):
+        """Reset the internal state of the model (e.g. memory banks)."""
+        self.memory.reset()
+
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+        self, images, img_masks, tokens, masks, episode_ids=None, episode_timesteps=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -651,6 +661,20 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
+
+        # --- PerMemBank: perception-level memory on SigLIP visual features ---
+        if self.memory.enabled and len(embs) > 0:
+            merged_img_embs = torch.cat(embs, dim=1)
+            merged_pad_masks = torch.cat(pad_masks, dim=1)
+
+            merged_img_embs = self.memory.augment_perception(
+                merged_img_embs, episode_ids, episode_timesteps,
+            )
+
+            embs = [merged_img_embs]
+            pad_masks = [merged_pad_masks]
+            att_masks = [0] * merged_img_embs.shape[1]
+        # ---------------------------------------------------------------
 
         # Process language tokens
         def lang_embed_func(tokens):
@@ -671,6 +695,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+        # --- CogMemBank: retrieve cognition memory to augment prefix_embs ---
+        embs = self.memory.augment_cognition_retrieve(embs, episode_ids)
+        # -------------------------------------------------------------------
 
         return embs, pad_masks, att_masks
 
@@ -721,7 +749,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self, images, img_masks, tokens, masks, actions, noise=None, time=None,
+        episode_ids=None, episode_timesteps=None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -733,7 +764,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps,
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
@@ -752,7 +785,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -760,11 +793,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
+
+        # --- CogMemBank: store post-LLM prefix features for next frame ---
+        self.memory.store_cognition(prefix_out, episode_ids, episode_timesteps)
+        # -----------------------------------------------------------------
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -803,20 +840,29 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        episode_ids = kwargs.get("episode_ids", None)
+        episode_timesteps = kwargs.get("episode_timesteps", None)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps,
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        [prefix_out, _], past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        # --- CogMemBank: store post-LLM prefix features for next step ---
+        self.memory.store_cognition(prefix_out, episode_ids, episode_timesteps)
+        # -----------------------------------------------------------------
 
         dt = -1.0 / num_steps
 
@@ -1111,6 +1157,9 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        # Reset memory bank and inference timestep counter
+        self.model.reset()
+        self._inference_timestep = 0
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1225,6 +1274,13 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        # Pass memory context for inference (episode_id=0, auto-incrementing timestep)
+        if self.config.memory is not None and self.config.memory.use_memory:
+            bsize = tokens.shape[0]
+            kwargs["episode_ids"] = [0] * bsize
+            kwargs["episode_timesteps"] = [self._inference_timestep] * bsize
+            self._inference_timestep += 1
+
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
 
@@ -1249,8 +1305,15 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
 
+        # Extract memory-related info from batch if available
+        episode_ids = batch.get("episode_index", None)
+        episode_timesteps = batch.get("frame_index", batch.get("timestamp", None))
+
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses = self.model.forward(
+            images, img_masks, tokens, masks, actions,
+            episode_ids=episode_ids, episode_timesteps=episode_timesteps,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]

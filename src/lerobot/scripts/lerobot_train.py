@@ -337,16 +337,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    has_memory = getattr(cfg.policy, "memory", None) is not None
+
+    drop_n_last_frames = getattr(cfg.policy, "drop_n_last_frames", None)
+    if drop_n_last_frames is None and has_memory:
+        drop_n_last_frames = getattr(cfg.policy.memory, "drop_n_last_frames", 0)
+
+    if drop_n_last_frames is not None:
         shuffle = False
         # When memory is enabled, frames must be in sequential order for the memory bank
-        use_memory = getattr(cfg.policy, "use_memory", False)
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
-            shuffle=not use_memory,
+            drop_n_last_frames=drop_n_last_frames,
+            shuffle=not has_memory,
         )
     else:
         shuffle = True

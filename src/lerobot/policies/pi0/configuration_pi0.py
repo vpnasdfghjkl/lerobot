@@ -21,6 +21,7 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.memory import MemoryConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 DEFAULT_IMAGE_SIZE = 224
@@ -94,28 +95,8 @@ class PI0Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
-    # MemoryVLA settings — dual-track memory (Per + Cog)
-    use_memory: bool = False              # Enable perception memory (PerMemBank, pre-LLM)
-    use_cog_memory: bool = False          # Enable cognition memory (CogMemBank, post-LLM)
-    memory_length: int = 16
-    memory_retrieval_layers: int = 2
-    memory_fusion_type: str = "gate"
-    memory_consolidate_type: str = "tome"
-    memory_dataloader_type: str = "stream"   # 'stream' or 'group'
-    memory_group_size: int = 16
-    memory_gate_init_bias: float = 2.0      # GateFusion init bias: >0 favors original obs,
-                                            # 0.0 = equal mix (MemoryVLA default).
-                                            # 2.0 → sigmoid(2)≈0.88, conservative start.
-
-    # SceneAnchor — multi-view scene prior (MVCNN-style, SigLIP feature space)
-    use_scene_anchor: bool = False         # Enable scene anchor module
-    scene_token_length: int = 64           # Number of output scene tokens
-    scene_compress_mode: str = "perceiver" # 'pool' (lightweight) or 'perceiver' (expressive)
-    scene_perceiver_depth: int = 2         # Cross-attention layers (perceiver mode only)
-
-    # Drop last N frames per episode (enables EpisodeAwareSampler in training script;
-    # also needed when use_memory=True so the sampler groups frames by episode)
-    drop_n_last_frames: int = 0
+    # MemoryVLA — episodic memory (None = disabled, zero overhead)
+    memory: MemoryConfig | None = None
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
 
@@ -136,21 +117,6 @@ class PI0Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
-
-        # Cog memory requires per memory to be enabled
-        if self.use_cog_memory and not self.use_memory:
-            raise ValueError("use_cog_memory=True requires use_memory=True")
-
-        # Validate scene anchor configuration
-        if self.use_scene_anchor:
-            if self.scene_compress_mode not in ("pool", "perceiver"):
-                raise ValueError(f"Invalid scene_compress_mode: {self.scene_compress_mode}")
-            if self.scene_token_length <= 0:
-                raise ValueError(f"scene_token_length must be positive, got {self.scene_token_length}")
-
-        # When memory is enabled, ensure drop_n_last_frames is set for EpisodeAwareSampler
-        if self.use_memory and self.drop_n_last_frames == 0:
-            self.drop_n_last_frames = self.chunk_size
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

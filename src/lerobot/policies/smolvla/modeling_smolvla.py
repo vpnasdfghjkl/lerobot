@@ -62,6 +62,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from typing_extensions import Unpack
 
+from lerobot.policies.memory import MemoryIntegration
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -77,6 +78,8 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    episode_ids: list | None
+    episode_timesteps: list | None
 
 
 def create_sinusoidal_pos_embedding(
@@ -257,6 +260,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        # Reset memory bank and inference timestep counter
+        self.model.reset()
+        self._inference_timestep = 0
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -293,6 +299,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        # Pass memory context for inference (episode_id=0, auto-incrementing timestep)
+        if self.config.memory is not None:
+            bsize = state.shape[0]
+            kwargs["episode_ids"] = [0] * bsize
+            kwargs["episode_timesteps"] = [self._inference_timestep] * bsize
+            self._inference_timestep += 1
 
         actions = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
@@ -466,6 +479,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
 
+        # Extract memory-related info from batch if available
+        episode_ids = batch.get("episode_index", None)
+        episode_timesteps = batch.get("frame_index", batch.get("timestamp", None))
+
         has_reflow_in_batch = "reflow_noise" in batch and "reflow_actions" in batch
         use_reflow = self.config.reflow_enabled and (has_reflow_in_batch or self._reflow_data is not None)
 
@@ -479,37 +496,51 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 # For list, randomly pick one pair per sample for diversity.
                 sample_indices = batch["index"]
                 positions = []
+                missing_reflow_data = False
                 for idx in sample_indices:
-                    entry = self._reflow_index_map[idx.item()]
+                    idx_val = idx.item()
+                    if idx_val not in self._reflow_index_map:
+                        missing_reflow_data = True
+                        break
+                    
+                    entry = self._reflow_index_map[idx_val]
                     if isinstance(entry, list):
                         positions.append(random.choice(entry))
                     else:
                         positions.append(entry)
-                positions = torch.tensor(positions, dtype=torch.long)
-                reflow_noise = self._reflow_data["reflow_noise"][positions].to(state.device)
-                reflow_actions = self._reflow_data["reflow_actions"][positions].to(state.device)
+                
+                if missing_reflow_data:
+                    # Fallback to standard training if reflow data is incomplete for this batch
+                    use_reflow = False
+                else:
+                    positions = torch.tensor(positions, dtype=torch.long)
+                    reflow_noise = self._reflow_data["reflow_noise"][positions].to(state.device)
+                    reflow_actions = self._reflow_data["reflow_actions"][positions].to(state.device)
 
+        if use_reflow:
             # reflow data is already in full max_action_dim space (no padding needed)
             losses = self.model.forward_reflow(
                 images, img_masks, lang_tokens, lang_masks, state,
-                reflow_noise, reflow_actions, time
+                reflow_noise, reflow_actions, time,
+                episode_ids=episode_ids, episode_timesteps=episode_timesteps,
             )
         else:
             # Standard 1-RF training
             actions = self.prepare_action(batch)
             losses = self.model.forward(
-                images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+                images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
+                episode_ids=episode_ids, episode_timesteps=episode_timesteps,
             )
-        loss_dict["losses_after_forward"] = losses.clone()
+        loss_dict["losses_after_forward"] = losses.mean().item()
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone()
+            loss_dict["losses_after_in_ep_bound"] = losses.mean().item()
 
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
-        loss_dict["losses_after_rm_padding"] = losses.clone()
+        loss_dict["losses_after_rm_padding"] = losses.mean().item()
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
@@ -690,9 +721,11 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
         )
-        self.state_proj = nn.Linear(
-            self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
-        )
+        # Initialize MemoryVLA (dual-track: Per + Cog) via shared integration
+        vlm_hidden_size = self.vlm_with_expert.config.text_config.hidden_size
+        self.memory = MemoryIntegration(config.memory, token_size=vlm_hidden_size)
+
+        self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
 
@@ -738,8 +771,13 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
+    def reset(self):
+        """Reset the internal state of the model (e.g. memory banks)."""
+        self.memory.reset()
+
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None,
+        episode_ids=None, episode_timesteps=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -747,6 +785,11 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        # Collect raw image embeddings separately for memory augmentation
+        img_embs_list = []
+        img_pad_masks_list = []
+        img_att_masks_count = 0
+
         for _img_idx, (
             img,
             img_mask,
@@ -767,7 +810,6 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_start_mask)
 
             img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
@@ -775,6 +817,10 @@ class VLAFlowMatching(nn.Module):
 
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+
+            img_embs_list.append(img_emb)
+            img_pad_masks_list.append(img_mask)
+            img_att_masks_count += num_img_embs
 
             embs.append(img_emb)
             pad_masks.append(img_mask)
@@ -794,6 +840,29 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+
+        # --- PerMemBank: perception-level memory on visual features ---
+        if self.memory.enabled and len(img_embs_list) > 0:
+            merged_img_embs = torch.cat(img_embs_list, dim=1)   # (B, 64, 960)
+            augmented_img_embs = self.memory.augment_perception(
+                merged_img_embs, episode_ids, episode_timesteps,
+            )   # (B, 64, 960)
+            # Replace original image embeddings in embs list with augmented version
+            # Rebuild embs: replace img_emb entries with augmented chunks
+            new_embs = []
+            img_idx = 0
+            aug_offset = 0
+            for e in embs:
+                if img_idx < len(img_embs_list) and e is img_embs_list[img_idx]:
+                    n_tokens = e.shape[1]
+                    new_embs.append(augmented_img_embs[:, aug_offset:aug_offset + n_tokens, :])
+                    aug_offset += n_tokens
+                    img_idx += 1
+                else:
+                    new_embs.append(e)
+            embs = new_embs
+        # ---------------------------------------------------------------
+
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -821,6 +890,10 @@ class VLAFlowMatching(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         att_masks = att_masks[None, :]
+
+        # --- CogMemBank: retrieve cognition memory to augment prefix_embs ---
+        embs = self.memory.augment_cognition_retrieve(embs, episode_ids)
+        # -------------------------------------------------------------------
 
         seq_len = pad_masks.shape[1]
         if seq_len < self.prefix_length:
@@ -876,7 +949,8 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
+        episode_ids=None, episode_timesteps=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -889,7 +963,8 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state,
+            episode_ids=episode_ids, episode_timesteps=episode_timesteps,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -898,14 +973,19 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
+            inputs_embeds=[prefix_embs, suffix_embs],   # [B, 113, 960], [B, 30, 720]
             use_cache=False,
             fill_kv_cache=False,
         )
+
+        # --- CogMemBank: store post-VLM prefix features for next frame ---
+        self.memory.store_cognition(prefix_out, episode_ids, episode_timesteps)
+        # -----------------------------------------------------------------
+
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -915,7 +995,8 @@ class VLAFlowMatching(nn.Module):
 
     def forward_reflow(
         self, images, img_masks, lang_tokens, lang_masks, state,
-        reflow_noise: Tensor, reflow_actions: Tensor, time=None
+        reflow_noise: Tensor, reflow_actions: Tensor, time=None,
+        episode_ids=None, episode_timesteps=None,
     ) -> Tensor:
         """2-RF training forward: regress velocity field along the straight line
         connecting anchored noise and teacher-predicted actions.
@@ -935,7 +1016,8 @@ class VLAFlowMatching(nn.Module):
         u_t = reflow_noise - reflow_actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state,
+            episode_ids=episode_ids, episode_timesteps=episode_timesteps,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
@@ -944,7 +1026,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -952,6 +1034,11 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
+
+        # --- CogMemBank: store post-VLM prefix features for next frame ---
+        self.memory.store_cognition(prefix_out, episode_ids, episode_timesteps)
+        # -----------------------------------------------------------------
+
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
@@ -976,13 +1063,17 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
+        episode_ids = kwargs.get("episode_ids", None)
+        episode_timesteps = kwargs.get("episode_timesteps", None)
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state,
+            episode_ids=episode_ids, episode_timesteps=episode_timesteps,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        [prefix_out, _], past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -990,6 +1081,10 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+
+        # --- CogMemBank: store post-VLM prefix features for next step ---
+        self.memory.store_cognition(prefix_out, episode_ids, episode_timesteps)
+        # -----------------------------------------------------------------
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 

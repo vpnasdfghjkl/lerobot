@@ -1,14 +1,14 @@
 """
-MemoryVLA memory bank module for PI0.
+Shared MemoryVLA memory bank module for VLA policies.
 
-Ported from temp/MemoryVLA/vla/memory_vla.py with minimal adaptation.
 Provides episodic memory via cross-attention retrieval and gated fusion.
+Can be integrated into any VLA policy (PI0, PI0.5, SmolVLA, etc.).
 
 Dual-track memory:
-  - PerMemBank: perception-level memory on SigLIP visual features (pre-LLM).
-  - CogMemBank: cognition-level memory on PaliGemma output features (post-LLM).
+  - PerMemBank: perception-level memory on visual features (pre-LLM).
+  - CogMemBank: cognition-level memory on VLM output features (post-LLM).
     Stores and retrieves are decoupled because the store happens after the
-    PaliGemma+Expert forward, while retrieval happens before the next forward.
+    VLM+Expert forward, while retrieval happens before the next forward.
     A learnable retrieve_norm + separate K/V projections in the cross-attention
     blocks bridge the semantic gap between post-LLM stored features and
     pre-LLM query features.

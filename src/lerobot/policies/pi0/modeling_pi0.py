@@ -44,8 +44,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi0.configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
-from lerobot.policies.pi0.memory_module import CogMemBank, PerMemBank
-from lerobot.policies.pi0.scene_encoder import SceneAnchor
+from lerobot.policies.memory import MemoryIntegration
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -59,7 +58,8 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
-    scene_features: Tensor | None
+    episode_ids: list | None
+    episode_timesteps: list | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -620,46 +620,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
-        # Initialize MemoryVLA Banks (dual-track: Per + Cog)
-        mem_token_size = paligemma_config.width
-        mem_bank_kwargs = dict(
-            dataloader_type=config.memory_dataloader_type,
-            group_size=config.memory_group_size,
-            token_size=mem_token_size,
-            mem_length=config.memory_length,
-            retrieval_layers=config.memory_retrieval_layers,
-            fusion_type=config.memory_fusion_type,
-            consolidate_type=config.memory_consolidate_type,
-            use_timestep_pe=True,
-            gate_init_bias=config.memory_gate_init_bias,
-        )
-
-        if config.use_memory:
-            self.per_mem_bank = PerMemBank(**mem_bank_kwargs)
-            if config.dtype == "bfloat16":
-                self.per_mem_bank = self.per_mem_bank.to(dtype=torch.bfloat16)
-        else:
-            self.per_mem_bank = None
-
-        if config.use_cog_memory:
-            self.cog_mem_bank = CogMemBank(**mem_bank_kwargs)
-            if config.dtype == "bfloat16":
-                self.cog_mem_bank = self.cog_mem_bank.to(dtype=torch.bfloat16)
-        else:
-            self.cog_mem_bank = None
-
-        # SceneAnchor — multi-view scene prior (MVCNN-style, SigLIP feature space)
-        if config.use_scene_anchor:
-            self.scene_anchor = SceneAnchor(
-                embed_dim=paligemma_config.width,
-                n_tokens=config.scene_token_length,
-                compress_mode=config.scene_compress_mode,
-                perceiver_depth=config.scene_perceiver_depth,
-            )
-            if config.dtype == "bfloat16":
-                self.scene_anchor = self.scene_anchor.to(dtype=torch.bfloat16)
-        else:
-            self.scene_anchor = None
+        # Initialize MemoryVLA (dual-track: Per + Cog) via shared integration
+        self.memory = MemoryIntegration(config.memory, token_size=paligemma_config.width, dtype=config.dtype)
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
@@ -690,10 +652,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def reset(self):
         """Reset the internal state of the model (e.g. memory banks)."""
-        if self.per_mem_bank is not None:
-            self.per_mem_bank.reset()
-        if self.cog_mem_bank is not None:
-            self.cog_mem_bank.reset()
+        self.memory.reset()
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -745,7 +704,6 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, episode_ids=None, episode_timesteps=None,
-        scene_features=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -766,30 +724,17 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             att_masks += [0] * num_img_embs
 
         # --- PerMemBank: perception-level memory on SigLIP visual features ---
-        if self.per_mem_bank is not None and len(embs) > 0:
+        if self.memory.enabled and len(embs) > 0:
             merged_img_embs = torch.cat(embs, dim=1)
             merged_pad_masks = torch.cat(pad_masks, dim=1)
 
-            merged_img_embs = self.per_mem_bank.process_batch(
-                tokens=merged_img_embs,
-                episode_ids=episode_ids,
-                timesteps=episode_timesteps,
+            merged_img_embs = self.memory.augment_perception(
+                merged_img_embs, episode_ids, episode_timesteps,
             )
 
             embs = [merged_img_embs]
             pad_masks = [merged_pad_masks]
             att_masks = [0] * merged_img_embs.shape[1]
-        # ---------------------------------------------------------------
-
-        # --- SceneAnchor: multi-view scene tokens (same SigLIP space as img tokens) ---
-        # Placed between image and language tokens so self-attention naturally
-        # attends between observation ↔ scene ↔ language.
-        if self.scene_anchor is not None and scene_features is not None:
-            scene_tokens = self.scene_anchor(scene_features)  # (B, N_scene, D)
-            bsize_scene = scene_tokens.shape[0]
-            embs.append(scene_tokens)
-            pad_masks.append(torch.ones(bsize_scene, scene_tokens.shape[1], dtype=torch.bool, device=scene_tokens.device))
-            att_masks += [0] * scene_tokens.shape[1]
         # ---------------------------------------------------------------
 
         # Process language tokens
@@ -813,11 +758,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         # --- CogMemBank: retrieve cognition memory to augment prefix_embs ---
-        if self.cog_mem_bank is not None:
-            embs = self.cog_mem_bank.retrieve_and_fuse(
-                query_tokens=embs,
-                episode_ids=episode_ids,
-            )
+        embs = self.memory.augment_cognition_retrieve(embs, episode_ids)
         # -------------------------------------------------------------------
 
         return embs, pad_masks, att_masks
@@ -887,7 +828,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
-        episode_ids=None, episode_timesteps=None, scene_features=None,
+        episode_ids=None, episode_timesteps=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
@@ -902,7 +843,6 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps,
-            scene_features=scene_features,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
@@ -943,12 +883,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         # --- CogMemBank: store post-LLM prefix features for next frame ---
-        if self.cog_mem_bank is not None:
-            self.cog_mem_bank.store_batch(
-                tokens=prefix_out,
-                episode_ids=episode_ids,
-                timesteps=episode_timesteps,
-            )
+        self.memory.store_cognition(prefix_out, episode_ids, episode_timesteps)
         # -----------------------------------------------------------------
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -991,11 +926,9 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         episode_ids = kwargs.get("episode_ids", None)
         episode_timesteps = kwargs.get("episode_timesteps", None)
-        scene_features = kwargs.get("scene_features", None)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, episode_ids=episode_ids, episode_timesteps=episode_timesteps,
-            scene_features=scene_features,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1012,12 +945,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         # --- CogMemBank: store post-LLM prefix features for next step ---
-        if self.cog_mem_bank is not None:
-            self.cog_mem_bank.store_batch(
-                tokens=prefix_out,
-                episode_ids=episode_ids,
-                timesteps=episode_timesteps,
-            )
+        self.memory.store_cognition(prefix_out, episode_ids, episode_timesteps)
         # -----------------------------------------------------------------
 
         dt = -1.0 / num_steps
@@ -1432,15 +1360,11 @@ class PI0Policy(PreTrainedPolicy):
         state = self.prepare_state(batch)
 
         # Pass memory context for inference (episode_id=0, auto-incrementing timestep)
-        if self.config.use_memory:
+        if getattr(self.config, "memory", None) is not None:
             bsize = state.shape[0]
             kwargs["episode_ids"] = [0] * bsize
             kwargs["episode_timesteps"] = [self._inference_timestep] * bsize
             self._inference_timestep += 1
-
-        # Pass scene features if available in batch
-        if self.config.use_scene_anchor and "observation.scene_features" in batch:
-            kwargs["scene_features"] = batch["observation.scene_features"]
 
         # Sample actions using the model (pass through RTC kwargs)
         actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, **kwargs)
@@ -1472,14 +1396,10 @@ class PI0Policy(PreTrainedPolicy):
         # 'frame_index' denotes time within episode (preferred for timestep PE)
         episode_timesteps = batch.get("frame_index", batch.get("timestamp", None))
 
-        # Extract scene features if scene anchor is enabled
-        scene_features = batch.get("observation.scene_features", None)
-
         # Compute loss
         losses = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, state, actions,
             episode_ids=episode_ids, episode_timesteps=episode_timesteps,
-            scene_features=scene_features,
         )
 
         # Truncate losses to actual action dimensions

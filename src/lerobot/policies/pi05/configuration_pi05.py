@@ -17,6 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.memory import MemoryConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
@@ -94,6 +95,9 @@ class PI05Config(PreTrainedConfig):
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
+
+    # MemoryVLA — episodic memory (None = disabled, zero overhead)
+    memory: MemoryConfig | None = None
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 

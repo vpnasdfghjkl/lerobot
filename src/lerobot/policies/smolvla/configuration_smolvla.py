@@ -15,6 +15,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.memory import MemoryConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import (
@@ -110,6 +111,9 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
+
+    # MemoryVLA — episodic memory (None = disabled, zero overhead)
+    memory: MemoryConfig | None = None
 
     def __post_init__(self):
         super().__post_init__()
