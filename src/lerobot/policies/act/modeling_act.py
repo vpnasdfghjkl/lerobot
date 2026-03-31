@@ -437,22 +437,42 @@ class ACT(nn.Module):
                 self.spatial_refine_gate = None
 
             # IMPROVEMENT: Look Closer modules
-            # Cross-view attention: head_cam ←→ each wrist cam
-            n_cams = len(self.config.image_features)
-            if config.use_look_closer and n_cams >= 2:
+            # Cross-view attention: head_cam ←→ each peripheral cam (star topology)
+            # Build explicit camera role → index mapping from config key names.
+            # Convention: key containing "cam_h" or "head" is the hub camera;
+            #             keys containing "cam_l" / "left" are left peripheral;
+            #             keys containing "cam_r" / "right" are right peripheral.
+            cam_keys = list(self.config.image_features.keys())
+            self._lc_cam_keys = cam_keys  # store for forward()
+
+            def _find_cam_index(patterns: list[str]) -> int | None:
+                for i, k in enumerate(cam_keys):
+                    kl = k.lower()
+                    if any(p in kl for p in patterns):
+                        return i
+                return None
+
+            self._lc_head_idx = _find_cam_index(["cam_h", "head", "zed"])
+            self._lc_left_idx = _find_cam_index(["cam_l", "left", "wrist_l"])
+            self._lc_right_idx = _find_cam_index(["cam_r", "right", "wrist_r"])
+
+            has_head = self._lc_head_idx is not None
+            has_left = self._lc_left_idx is not None
+            has_right = self._lc_right_idx is not None
+
+            if config.use_look_closer and has_head and (has_left or has_right):
                 self.use_look_closer = True
 
-                # Pair 1: head ←→ wrist_l (indices 0, 1)
-                self.lc_attn_h2l = LookCloserAttention(feature_dim)
-                self.lc_norm_h2l = nn.LayerNorm(feature_dim)
-                self.lc_mlp_h2l = LookCloserMlp(feature_dim)
+                if has_left:
+                    self.lc_attn_h2l = LookCloserAttention(feature_dim)
+                    self.lc_norm_h2l = nn.LayerNorm(feature_dim)
+                    self.lc_mlp_h2l = LookCloserMlp(feature_dim)
 
-                self.lc_attn_l2h = LookCloserAttention(feature_dim)
-                self.lc_norm_l2h = nn.LayerNorm(feature_dim)
-                self.lc_mlp_l2h = LookCloserMlp(feature_dim)
+                    self.lc_attn_l2h = LookCloserAttention(feature_dim)
+                    self.lc_norm_l2h = nn.LayerNorm(feature_dim)
+                    self.lc_mlp_l2h = LookCloserMlp(feature_dim)
 
-                # Pair 2: head ←→ wrist_r (indices 0, 2)
-                if n_cams >= 3:
+                if has_right:
                     self.lc_attn_h2r = LookCloserAttention(feature_dim)
                     self.lc_norm_h2r = nn.LayerNorm(feature_dim)
                     self.lc_mlp_h2r = LookCloserMlp(feature_dim)
@@ -609,70 +629,56 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                # cam_features = self.backbone(img)["feature_map"]
-                # cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                # cam_features = self.encoder_img_feat_input_proj(cam_features)
 
-                # # Rearrange features to (sequence, batch, dim).
-                # cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
-                # cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
-
-                # # Extend immediately instead of accumulating and concatenating
-                # # Convert to list to extend properly
-                # encoder_in_tokens.extend(list(cam_features))
-                # encoder_in_pos_embed.extend(list(cam_pos_embed))
-                pass
-
-            # IMPROVEMENT PREPARATION: Collect features first, then refine per-view
+            # Collect backbone features per view, then refine before encoding.
             image_features_list = []
-            
+
             # Visualization initialization
             capture_viz = getattr(self, "return_features_for_viz", False)
             if capture_viz:
                 self.viz_features = {"backbone": [], "gate": [], "look_closer": []}
 
-            # Helper to safely call gate
             use_gate = hasattr(self, "spatial_refine_gate") and self.spatial_refine_gate is not None
-            
+
             for img in batch[OBS_IMAGES]:
                 feat = self.backbone(img)["feature_map"]
-                
-                # capture backbone output
+
                 if capture_viz:
                     self.viz_features["backbone"].append(feat)
 
                 if use_gate:
                     feat = self.spatial_refine_gate(feat)
-                    # capture gate output
                     if capture_viz:
                         self.viz_features["gate"].append(feat)
-                
+
                 image_features_list.append(feat)
 
-            # IMPROVEMENT: Look Closer mixing
-            # head_cam ←→ each wrist cam (star topology centered on head)
+            # Look Closer mixing — star topology centered on head camera.
+            # Uses explicit name-based indices built in __init__ (not positional).
             if getattr(self, "use_look_closer", False):
-                head = image_features_list[0]
-                wl = image_features_list[1]
+                hi = self._lc_head_idx
+                li = self._lc_left_idx
+                ri = self._lc_right_idx
+                head = image_features_list[hi]
 
-                # Pair 1: head ←→ wrist_l
-                head = self._lc_block(head, wl, self.lc_attn_h2l, self.lc_norm_h2l, self.lc_mlp_h2l)
-                wl = self._lc_block(wl, head, self.lc_attn_l2h, self.lc_norm_l2h, self.lc_mlp_l2h)
-                image_features_list[0] = head
-                image_features_list[1] = wl
+                # Pair 1: head ←→ left
+                if li is not None:
+                    wl = image_features_list[li]
+                    head = self._lc_block(head, wl, self.lc_attn_h2l, self.lc_norm_h2l, self.lc_mlp_h2l)
+                    wl = self._lc_block(wl, head, self.lc_attn_l2h, self.lc_norm_l2h, self.lc_mlp_l2h)
+                    image_features_list[li] = wl
 
-                # Pair 2: head ←→ wrist_r
-                if len(image_features_list) >= 3:
-                    wr = image_features_list[2]
-                    head = self._lc_block(image_features_list[0], wr, self.lc_attn_h2r, self.lc_norm_h2r, self.lc_mlp_h2r)
+                # Pair 2: head ←→ right
+                if ri is not None:
+                    wr = image_features_list[ri]
+                    head = self._lc_block(head, wr, self.lc_attn_h2r, self.lc_norm_h2r, self.lc_mlp_h2r)
                     wr = self._lc_block(wr, head, self.lc_attn_r2h, self.lc_norm_r2h, self.lc_mlp_r2h)
-                    image_features_list[0] = head
-                    image_features_list[2] = wr
-            
-            # Capture final LookCloser state (or just the state before projection if LC not used)
+                    image_features_list[ri] = wr
+
+                image_features_list[hi] = head
+
             if capture_viz:
-                self.viz_features["look_closer"] = [x for x in image_features_list]
+                self.viz_features["look_closer"] = list(image_features_list)
 
             for cam_features in image_features_list:
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
