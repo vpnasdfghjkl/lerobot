@@ -17,9 +17,10 @@
 import logging
 from functools import cached_property
 
-from lerobot.processor import RobotAction, RobotObservation
-from lerobot.robots.openarm_follower import OpenArmFollower, OpenArmFollowerConfig
+from lerobot.types import RobotAction, RobotObservation
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
+from ..openarm_follower import OpenArmFollower, OpenArmFollowerConfig
 from ..robot import Robot
 from .config_bi_openarm_follower import BiOpenArmFollowerConfig
 
@@ -38,13 +39,24 @@ class BiOpenArmFollower(Robot):
         super().__init__(config)
         self.config = config
 
+        # Top-level cameras are distributed evenly: each arm's OpenArmFollower
+        # will only open the cameras assigned to it. Per-arm cameras are used
+        # as fallback when top-level cameras are empty.
+        if config.cameras:
+            left_cameras = config.cameras
+            right_cameras = {}
+        else:
+            left_cameras = config.left_arm_config.cameras
+            right_cameras = config.right_arm_config.cameras
+
         left_arm_config = OpenArmFollowerConfig(
             id=f"{config.id}_left" if config.id else None,
             calibration_dir=config.calibration_dir,
             port=config.left_arm_config.port,
             disable_torque_on_disconnect=config.left_arm_config.disable_torque_on_disconnect,
+            use_velocity_and_torque=config.left_arm_config.use_velocity_and_torque,
             max_relative_target=config.left_arm_config.max_relative_target,
-            cameras=config.left_arm_config.cameras,
+            cameras=left_cameras,
             side=config.left_arm_config.side,
             can_interface=config.left_arm_config.can_interface,
             use_can_fd=config.left_arm_config.use_can_fd,
@@ -61,8 +73,9 @@ class BiOpenArmFollower(Robot):
             calibration_dir=config.calibration_dir,
             port=config.right_arm_config.port,
             disable_torque_on_disconnect=config.right_arm_config.disable_torque_on_disconnect,
+            use_velocity_and_torque=config.right_arm_config.use_velocity_and_torque,
             max_relative_target=config.right_arm_config.max_relative_target,
-            cameras=config.right_arm_config.cameras,
+            cameras=right_cameras,
             side=config.right_arm_config.side,
             can_interface=config.right_arm_config.can_interface,
             use_can_fd=config.right_arm_config.use_can_fd,
@@ -85,20 +98,19 @@ class BiOpenArmFollower(Robot):
         left_arm_motors_ft = self.left_arm._motors_ft
         right_arm_motors_ft = self.right_arm._motors_ft
 
+        # Right first, then left — matches the teleoperator (OpenArmMini) ordering
+        # and the dataset feature names recorded during data collection.
         return {
-            **{f"left_{k}": v for k, v in left_arm_motors_ft.items()},
             **{f"right_{k}": v for k, v in right_arm_motors_ft.items()},
+            **{f"left_{k}": v for k, v in left_arm_motors_ft.items()},
         }
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        left_arm_cameras_ft = self.left_arm._cameras_ft
-        right_arm_cameras_ft = self.right_arm._cameras_ft
-
-        return {
-            **{f"left_{k}": v for k, v in left_arm_cameras_ft.items()},
-            **{f"right_{k}": v for k, v in right_arm_cameras_ft.items()},
-        }
+        # Cameras already have unique user-chosen names (e.g. "left_wrist", "base",
+        # "right_wrist"), so we merge them directly — unlike motors which need the
+        # left_/right_ prefix to disambiguate identical per-arm joint names.
+        return {**self.left_arm._cameras_ft, **self.right_arm._cameras_ft}
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -112,6 +124,7 @@ class BiOpenArmFollower(Robot):
     def is_connected(self) -> bool:
         return self.left_arm.is_connected and self.right_arm.is_connected
 
+    @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         self.left_arm.connect(calibrate)
         self.right_arm.connect(calibrate)
@@ -133,19 +146,27 @@ class BiOpenArmFollower(Robot):
             "Motor ID configuration is typically done via manufacturer tools for CAN motors."
         )
 
+    @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         obs_dict = {}
 
-        # Add "left_" prefix
-        left_obs = self.left_arm.get_observation()
-        obs_dict.update({f"left_{key}": value for key, value in left_obs.items()})
+        # Camera keys that should NOT get the arm prefix (they already have unique names)
+        left_cam_keys = set(self.left_arm.cameras.keys())
+        right_cam_keys = set(self.right_arm.cameras.keys())
 
-        # Add "right_" prefix
+        # Right first, then left — matches the teleoperator (OpenArmMini) ordering
+        # and the dataset feature names recorded during data collection.
         right_obs = self.right_arm.get_observation()
-        obs_dict.update({f"right_{key}": value for key, value in right_obs.items()})
+        for key, value in right_obs.items():
+            obs_dict[key if key in right_cam_keys else f"right_{key}"] = value
+
+        left_obs = self.left_arm.get_observation()
+        for key, value in left_obs.items():
+            obs_dict[key if key in left_cam_keys else f"left_{key}"] = value
 
         return obs_dict
 
+    @check_if_not_connected
     def send_action(
         self,
         action: RobotAction,
@@ -168,8 +189,9 @@ class BiOpenArmFollower(Robot):
         prefixed_sent_action_left = {f"left_{key}": value for key, value in sent_action_left.items()}
         prefixed_sent_action_right = {f"right_{key}": value for key, value in sent_action_right.items()}
 
-        return {**prefixed_sent_action_left, **prefixed_sent_action_right}
+        return {**prefixed_sent_action_right, **prefixed_sent_action_left}
 
+    @check_if_not_connected
     def disconnect(self):
         self.left_arm.disconnect()
         self.right_arm.disconnect()
